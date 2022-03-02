@@ -1,0 +1,19 @@
+# Named pipe for rsyslog to write IPs from iptables
+pipePath = "/var/log/diswall/diswall.pipe"
+
+# ipset list name for allowed IPs
+ipset_white_list = "diswall-wl"
+# ipset list name for blocked IPs
+ipset_black_list = "diswall-bl"
+
+# Work locally, without NATS server connection
+localonly = false
+
+# Configuration of NATS connection
+[nats]
+server = "diswall.stream"
+port = 4222
+client_name = "<ENTER YOU CLIENT NAME>"
+client_pass = "<ENTER YOUR PASSWORD>"
+# If you want to change your hostname that is used in NATS subject you can change it here
+#hostname = "server1"

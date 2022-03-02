@@ -1,0 +1,15 @@
+[package]
+name = "diswall"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+getopts = "0.2.21"
+log = "0.4.14"
+simplelog = "0.11.1"
+serde = { version = "1.0.133", features = ["derive"] }
+toml = "0.5.8"
+hostname = "^0.3"
+nats = "0.17"
