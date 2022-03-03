@@ -9,6 +9,7 @@ use getopts::{Matches, Options};
 use log::{debug, error, info, LevelFilter, warn};
 use nats::Connection;
 use simplelog::{ColorChoice, CombinedLogger, ConfigBuilder, LevelPadding, TerminalMode, TermLogger, WriteLogger};
+use ipset::ipset_list_exists;
 use crate::config::{Config, get_hostname};
 use crate::server::run_server;
 
@@ -85,7 +86,19 @@ fn main() {
         return;
     }
 
-    lock_on_pipe(config, nats).map_err(|e| error!("Error reading pipe: {}", e)).unwrap();
+    check_ipset_list_exists(&config.ipset_black_list);
+    check_ipset_list_exists(&config.ipset_white_list);
+
+    if let Err(e) = lock_on_pipe(config, nats) {
+        error!("Error reading pipe: {}", e);
+    }
+}
+
+fn check_ipset_list_exists(list_name: &String) {
+    if !ipset_list_exists(list_name) {
+        error!("ipset list {} does not exist!", list_name);
+        exit(1);
+    }
 }
 
 fn start_nats_handlers(config: &mut Config, nats: &Connection) {

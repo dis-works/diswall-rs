@@ -1,10 +1,8 @@
-use std::io::Read;
-use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use nats::Connection;
-use crate::Config;
+use crate::{Config, ipset};
 
 pub fn run_server(config: Config, nats: Option<Connection>) {
     if nats.is_none() {
@@ -20,7 +18,7 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
                 info!("Got wl init request from {}", &data);
                 let list_name = "diswall-wl";
                 let split = data.split("/").collect::<Vec<&str>>();
-                let buffer = get_ipset_list(list_name, split[0]);
+                let buffer = ipset::get_ipset_list(list_name, split[0]);
                 if let Err(e) = message.respond(buffer.as_bytes()) {
                     warn!("Error sending {} to {}: {}", list_name, split[0], e);
                 }
@@ -36,7 +34,7 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
                 info!("Got bl init request from {}", &data);
                 let list_name = "diswall-bl";
                 let split = data.split("/").collect::<Vec<&str>>();
-                let buffer = get_ipset_list(list_name, split[0]);
+                let buffer = ipset::get_ipset_list(list_name, split[0]);
                 if let Err(e) = message.respond(buffer.as_bytes()) {
                     warn!("Error sending {} to {}: {}", list_name, split[0], e);
                 }
@@ -51,34 +49,4 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
     loop {
         thread::sleep(delay);
     }
-}
-
-fn get_ipset_list(list_name: &str, user_name: &str) -> String {
-    let mut buffer = String::new();
-    let command = Command::new("ipset")
-        .arg("list")
-        .arg("-name")
-        .arg(format!("{}-{}", list_name, user_name))
-        .spawn();
-    match command {
-        Ok(_) => {
-            let command = Command::new("ipset")
-                .arg("save")
-                .arg(format!("{}-{}", list_name, user_name))
-                .stdout(Stdio::piped())
-                .spawn();
-            if let Ok(mut command) = command {
-                let mut io = command.stdout.take().unwrap();
-                if let Ok(size) = io.read_to_string(&mut buffer) {
-                    debug!("Got {} for {}, {} bytes long", list_name, user_name, size);
-                }
-            } else {
-                warn!("Error getting {} for {}", list_name, user_name);
-            }
-        }
-        Err(..) => {
-            info!("No {} for {}", list_name, user_name);
-        }
-    }
-    buffer
 }
