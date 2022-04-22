@@ -10,14 +10,15 @@ use log::{debug, error, info, LevelFilter, warn};
 use nats::Connection;
 use simplelog::{ColorChoice, CombinedLogger, ConfigBuilder, LevelPadding, TerminalMode, TermLogger, WriteLogger};
 use ipset::ipset_list_exists;
-use crate::config::{Config, get_hostname};
+use crate::config::Config;
+use crate::ipset::{ipset_list_create_bl, ipset_list_create_wl};
 use crate::server::run_server;
 
 mod config;
 mod ipset;
 mod server;
 
-fn main() {
+fn main() -> Result<(), i32> {
     let args: Vec<String> = env::args().collect();
     let program = args[0].clone();
 
@@ -26,17 +27,17 @@ fn main() {
     if opt_matches.opt_present("h") {
         let brief = format!("Usage: {} [options]", program);
         println!("{}", options.usage(&brief));
-        exit(0);
+        return Ok(());
     }
 
     if opt_matches.opt_present("v") {
         println!("DisWall v{}", env!("CARGO_PKG_VERSION"));
-        exit(0);
+        return Ok(());
     }
 
     if opt_matches.opt_present("g") {
         println!("{}", include_str!("../config/diswall.toml"));
-        exit(0);
+        return Ok(());
     }
 
     let file_name = match opt_matches.opt_str("c") {
@@ -50,26 +51,25 @@ fn main() {
     };
 
     // Override config options by options from arguments
-    override_config_from_args(&opt_matches, &mut config);
+    config.override_config_from_args(&opt_matches);
+    config.init_nats_subjects();
     setup_logger(&opt_matches);
     debug!("Loaded config:\n{:#?}", &config);
-
-    let run_as_server = opt_matches.opt_present("server");
 
     let nats = if !config.local_only && !config.nats.server.is_empty() {
         //let hostname = config::get_hostname();
         debug!("Connecting to NATS server...");
         let nats = nats::Options::with_user_pass(&config.nats.client_name, &config.nats.client_pass)
             .with_name("DisWall")
-            .error_callback(|error| error!("NATS connection error: {}", error))
+            .error_callback(|error| error!("NATS error: {}", error))
             .connect(format!("nats://{}:{}", &config.nats.server, &config.nats.port));
         match nats {
             Err(e) => {
                 error!("Error connecting to NATS server: {}", e);
-                exit(1);
+                return Err(1);
             }
             Ok(nats) => {
-                if !run_as_server {
+                if !config.server_mode {
                     info!("Connected to NATS server, setting up handlers");
                     start_nats_handlers(&mut config, &nats);
                 }
@@ -81,116 +81,128 @@ fn main() {
     };
 
     // If this binary is executed with 'server' parameter we start only NATS server
-    if run_as_server {
+    if config.server_mode {
         run_server(config, nats);
-        return;
+        return Ok(());
     }
 
-    check_ipset_list_exists(&config.ipset_black_list);
-    check_ipset_list_exists(&config.ipset_white_list);
+    if !ipset_list_exists(&config.ipset_black_list) {
+        info!("ipset list {} does not exist, creating", &config.ipset_black_list);
+        if !ipset_list_create_bl(&config.ipset_black_list) {
+            error!("Error creating ipset list {}", &config.ipset_black_list);
+            return Err(2);
+        }
+    }
+
+    if !ipset_list_exists(&config.ipset_white_list) {
+        info!("ipset list {} does not exist, creating", &config.ipset_white_list);
+        if !ipset_list_create_wl(&config.ipset_white_list) {
+            error!("Error creating ipset list {}", &config.ipset_white_list);
+            return Err(3);
+        }
+    }
 
     if let Err(e) = lock_on_pipe(config, nats) {
         error!("Error reading pipe: {}", e);
     }
-}
-
-fn check_ipset_list_exists(list_name: &String) {
-    if !ipset_list_exists(list_name) {
-        error!("ipset list {} does not exist!", list_name);
-        exit(1);
-    }
+    Ok(())
 }
 
 fn start_nats_handlers(config: &mut Config, nats: &Connection) {
-    // Getting whitelist for this client/host
-    let hostname = get_hostname();
-    let msg = format!("{}.{}", config.nats.client_name, hostname);
+    let msg = String::new();
     if let Ok(message) = nats.request(&config.nats.wl_init_subject, &msg) {
         let string = String::from_utf8(message.data).unwrap_or(String::default());
-        // Changing from individual name to common name
-        let s1 = format!(" {}-{} ", &config.ipset_white_list, &config.nats.client_name);
-        let s2 = format!(" {} ", &config.ipset_white_list);
-        let string = string.replace(&s1, &s2);
+        let mut buf = format!("create -exist {} hash:net comment", &config.ipset_white_list);
         for line in string.lines() {
+            buf.push('\n');
+            buf.push_str(&format!("add {} {}", &config.ipset_white_list, line));
+            // TODO remove print in production
             debug!("To whitelist: {}", line);
         }
-        ipset::run_ipset("restore", &string, &vec![]);
+        ipset::run_ipset("restore", "", &buf, None);
     }
 
     // Getting blocklist from server
     if let Ok(message) = nats.request(&config.nats.bl_init_subject, &msg) {
         let string = String::from_utf8(message.data).unwrap_or(String::default());
-        // Changing from individual name to common name
-        // TODO remove print in production
+        let mut buf = format!("create -exist {} hash:ip hashsize 32768 maxelem 1000000 timeout 86400", &config.ipset_black_list);
         for line in string.lines() {
+            buf.push('\n');
+            buf.push_str(&format!("add {} {}", &config.ipset_black_list, line));
+            // TODO remove print in production
             debug!("To blacklist: {}", line);
         }
-        ipset::run_ipset("restore", &string, &vec![]);
+        ipset::run_ipset("restore", "", &buf, None);
     }
 
     // Subscribe to new IPs for whitelist
     if let Ok(sub) = nats.subscribe(&config.nats.wl_add_subject) {
-        let list = config.ipset_white_list.clone();
+        let list_name = config.ipset_white_list.clone();
         sub.with_handler(move |message| {
             if let Ok(string) = String::from_utf8(message.data) {
                 let split = string.split("|").collect::<Vec<&str>>();
                 // If no comment
                 if split.len() == 1 {
                     debug!("Got IP for whitelist: {}", split[0]);
-                    ipset::run_ipset("add", split[0], &vec![list.as_str()]);
+                    ipset::run_ipset("add", &list_name, split[0], None);
                 } else {
                     debug!("Got IP for whitelist: {} ({})", split[0], split[1]);
-                    ipset::run_ipset("add", split[0], &vec![list.as_str(), split[1]]);
+                    ipset::run_ipset("add", &list_name, split[0], Some(split[1]));
                 }
             }
             Ok(())
         });
-        info!("Subscribed to whitelist additions");
+        info!("Subscribed to {}", &config.nats.wl_add_subject);
     }
 
     // Subscribe for new IPs for blocklist
     if let Ok(sub) = nats.subscribe(&config.nats.bl_add_subject) {
-        let list = config.ipset_black_list.clone();
+        let list_name = config.ipset_black_list.clone();
         sub.with_handler(move |message| {
             if let Ok(string) = String::from_utf8(message.data) {
-                let split = string.split("|").collect::<Vec<&str>>();
-                // If no comment
-                if split.len() == 1 {
-                    debug!("Got IP for blocklist: {}", split[0]);
-                } else {
-                    debug!("Got IP for blocklist {} from {}", split[0], split[1]);
-                }
-                ipset::run_ipset("add", split[0], &vec![list.as_str()]); // Don't add comment to ipset
+                ipset::run_ipset("add", &list_name, &string, None);
             }
             Ok(())
         });
-        debug!("Subscribed to blocklist additions");
+        info!("Subscribed to {}", &config.nats.bl_add_subject);
+    }
+
+    // Subscribe for new IPs for blocklist
+    if let Ok(sub) = nats.subscribe(&config.nats.bl_global_subject) {
+        let list_name = config.ipset_black_list.clone();
+        sub.with_handler(move |message| {
+            if let Ok(string) = String::from_utf8(message.data) {
+                ipset::run_ipset("add", &list_name, &string, None);
+            }
+            Ok(())
+        });
+        info!("Subscribed to {}", &config.nats.bl_global_subject);
     }
 
     // Subscribe for IPs to delete from whitelist
     if let Ok(sub) = nats.subscribe(&config.nats.wl_del_subject) {
-        let list = config.ipset_white_list.clone();
+        let list_name = config.ipset_white_list.clone();
         sub.with_handler(move |message| {
             if let Ok(string) = String::from_utf8(message.data) {
                 debug!("Got IP to delete from whitelist: {}", &string);
-                ipset::run_ipset("del", &string, &vec![list.as_str()]);
+                ipset::run_ipset("del", &list_name, &string, None);
             }
             Ok(())
         });
-        info!("Subscribed to whitelist removals");
+        info!("Subscribed to {}", &config.nats.wl_del_subject);
     }
 
     // Subscribe for IPs to delete from blocklist
     if let Ok(sub) = nats.subscribe(&config.nats.bl_del_subject) {
-        let list = config.ipset_black_list.clone();
+        let list_name = config.ipset_black_list.clone();
         sub.with_handler(move |message| {
             if let Ok(string) = String::from_utf8(message.data) {
                 debug!("Got IP to delete from blocklist: {}", &string);
-                ipset::run_ipset("del", &string, &vec![list.as_str()]);
+                ipset::run_ipset("del", &list_name, &string, None);
             }
             Ok(())
         });
-        info!("Subscribed to blocklist removals");
+        info!("Subscribed to {}", &config.nats.bl_del_subject);
     }
 }
 
@@ -200,7 +212,7 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>) -> Result<Infallible, 
     let mut reader = BufReader::new(f);
 
     debug!("Pipe opened, waiting for IPs");
-    let block_list = [config.ipset_black_list.as_str()];
+    let block_list = config.ipset_black_list.as_str();
     let mut line = String::new();
     let delay = Duration::from_millis(15);
     loop {
@@ -212,15 +224,15 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>) -> Result<Infallible, 
                     IpAddr::V4(ip) => {
                         if !ip.is_private() && !ip.is_loopback() && !ip.is_unspecified() {
                             debug!("Adding {} to {}", &line.trim(), config.ipset_black_list.as_str());
-                            ipset::run_ipset("add", line.trim(), &block_list);
-                            push_to_nats(&nats, &config.nats.bl_add_subject, ip.to_string(), &config.nats.hostname);
+                            ipset::run_ipset("add", &block_list, line.trim(), None);
+                            push_to_nats(&nats, &config.nats.bl_add_subject, ip.to_string());
                         }
                     }
                     IpAddr::V6(ip) => {
                         if !ip.is_loopback() && !ip.is_unspecified() {
                             debug!("Adding {} to {}", &line.trim(), config.ipset_black_list.as_str());
-                            ipset::run_ipset("add", line.trim(), &block_list);
-                            push_to_nats(&nats, &config.nats.bl_add_subject, ip.to_string(), &config.nats.hostname);
+                            ipset::run_ipset("add", &block_list, line.trim(), None);
+                            push_to_nats(&nats, &config.nats.bl_add_subject, ip.to_string());
                         }
                     }
                 }
@@ -233,40 +245,12 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>) -> Result<Infallible, 
 }
 
 /// Publishes some IP to NATS server with particular subject
-fn push_to_nats(nats: &Option<Connection>, subject: &str, ip: String, comment: &String) {
+fn push_to_nats(nats: &Option<Connection>, subject: &str, data: String) {
     if let Some(nats) = &nats {
-        let data = format!("{}|{}", ip, &comment);
         match nats.publish(subject, &data) {
             Ok(_) => info!("Pushed {} to [{}]", &data, subject),
             Err(e) => warn!("Error pushing {} to [{}]: {}", &data, subject, e)
         }
-    }
-}
-
-fn override_config_from_args(opt_matches: &Matches, config: &mut Config) {
-    if let Some(name) = opt_matches.opt_str("f") {
-        config.pipe_path = name;
-    }
-    if let Some(server) = opt_matches.opt_str("s") {
-        config.nats.server = server;
-    }
-    if let Ok(port) = opt_matches.opt_get::<u16>("P") {
-        config.nats.port = port.unwrap_or(4222);
-    }
-    if let Some(name) = opt_matches.opt_str("n") {
-        config.nats.client_name = name;
-    }
-    if let Some(pass) = opt_matches.opt_str("p") {
-        config.nats.client_pass = pass;
-    }
-    if opt_matches.opt_present("l") {
-        config.local_only = true;
-    }
-    if let Some(list) = opt_matches.opt_str("allow-list") {
-        config.ipset_white_list = list;
-    }
-    if let Some(list) = opt_matches.opt_str("block-list") {
-        config.ipset_black_list = list;
     }
 }
 

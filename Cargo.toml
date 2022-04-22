@@ -13,3 +13,4 @@ serde = { version = "1.0.133", features = ["derive"] }
 toml = "0.5.8"
 hostname = "^0.3"
 nats = "0.17"
+sqlite = "0.26.0"

@@ -1,8 +1,9 @@
 use std::process::{Command, Stdio};
-use std::io::{Read, Write};
+use std::io::Write;
+#[allow(unused_imports)]
 use log::{debug, error, info, warn};
 
-pub fn run_ipset(action: &str, data: &str, optional: &[&str]) {
+pub fn run_ipset(action: &str, list_name: &str, data: &str, comment: Option<&str>) {
     let data = data.trim();
     if action == "restore" {
         let command = Command::new("ipset")
@@ -19,9 +20,9 @@ pub fn run_ipset(action: &str, data: &str, optional: &[&str]) {
         }
     } else {
         let mut command = Command::new("ipset");
-        let command = match optional.len() {
-            2 => command.args(vec!["-exist", action, optional[0], data, "comment", optional[1]]),
-            _ => command.args(vec!["-exist", action, optional[0], data])
+        let command = match comment {
+            Some(comment) => command.args(vec!["-exist", action, list_name, data, "comment", comment]),
+            None => command.args(vec!["-exist", action, list_name, data])
         };
         if let Err(e) = command.spawn() {
             match action {
@@ -33,43 +34,60 @@ pub fn run_ipset(action: &str, data: &str, optional: &[&str]) {
     }
 }
 
-pub fn get_ipset_list(list_name: &str, user_name: &str) -> String {
-    let mut buffer = String::new();
-    let command = Command::new("ipset")
-        .arg("list")
-        .arg("-name")
-        .arg(format!("{}-{}", list_name, user_name))
-        .spawn();
-    match command {
-        Ok(_) => {
-            let command = Command::new("ipset")
-                .arg("save")
-                .arg(format!("{}-{}", list_name, user_name))
-                .stdout(Stdio::piped())
-                .spawn();
-            if let Ok(mut command) = command {
-                let mut io = command.stdout.take().unwrap();
-                if let Ok(size) = io.read_to_string(&mut buffer) {
-                    debug!("Got {} for {}, {} bytes long", list_name, user_name, size);
-                }
-            } else {
-                warn!("Error getting {} for {}", list_name, user_name);
-            }
-        }
-        Err(..) => {
-            info!("No {} for {}", list_name, user_name);
-        }
-    }
-    buffer
-}
-
 pub fn ipset_list_exists(list_name: &str) -> bool {
     let command = Command::new("ipset")
         .arg("list")
         .arg("-name")
         .arg(list_name)
+        .stdout(Stdio::piped())
         .spawn();
-    info!("List: {:?}", &command);
+    match command {
+        Ok(mut child) => {
+            match child.wait() {
+                Ok(status) => return status.success(),
+                Err(e) => error!("Error running ipset: {}", e)
+            }
+        }
+        Err(e) => error!("Error running ipset: {}", e)
+    }
+    false
+}
+
+/// Runs command `ipset create -exist diswall-wl hash:net comment`
+pub fn ipset_list_create_wl(list_name: &str) -> bool {
+    let command = Command::new("ipset")
+        .arg("create")
+        .arg("-exist")
+        .arg(list_name)
+        .arg("hash:net")
+        .arg("comment")
+        .spawn();
+    match command {
+        Ok(mut child) => {
+            match child.wait() {
+                Ok(status) => return status.success(),
+                Err(e) => error!("Error running ipset: {}", e)
+            }
+        }
+        Err(e) => error!("Error running ipset: {}", e)
+    }
+    false
+}
+
+/// Runs command `ipset create -exist diswall-bl hash:ip hashsize 32768 maxelem 1000000 timeout 86400`
+pub fn ipset_list_create_bl(list_name: &str) -> bool {
+    let command = Command::new("ipset")
+        .arg("create")
+        .arg("-exist")
+        .arg(list_name)
+        .arg("hash:ip")
+        .arg("hashsize")
+        .arg("32768")
+        .arg("maxelem")
+        .arg("1000000")
+        .arg("timeout")
+        .arg("86400")
+        .spawn();
     match command {
         Ok(mut child) => {
             match child.wait() {

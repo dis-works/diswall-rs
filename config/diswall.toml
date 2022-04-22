@@ -7,7 +7,9 @@ ipset_white_list = "diswall-wl"
 ipset_black_list = "diswall-bl"
 
 # Work locally, without NATS server connection
-localonly = false
+local_only = false
+# Work in server mode
+server_mode = false
 
 # Configuration of NATS connection
 [nats]
