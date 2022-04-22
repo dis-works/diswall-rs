@@ -24,11 +24,16 @@ pub fn run_ipset(action: &str, list_name: &str, data: &str, comment: Option<&str
             Some(comment) => command.args(vec!["-exist", action, list_name, data, "comment", comment]),
             None => command.args(vec!["-exist", action, list_name, data])
         };
-        if let Err(e) = command.spawn() {
-            match action {
-                "add" => error!("Error adding {} to ipset: {}", data, e),
-                "del" => error!("Error removing {} from ipset: {}", data, e),
-                &_ => error!("Error ipset command: {}", e)
+        match command.spawn() {
+            Err(e) => {
+                match action {
+                    "add" => error!("Error adding {} to ipset: {}", data, e),
+                    "del" => error!("Error removing {} from ipset: {}", data, e),
+                    &_ => error!("Error ipset command: {}", e)
+                }
+            }
+            Ok(mut child) => {
+                let _ = child.wait();
             }
         }
     }
