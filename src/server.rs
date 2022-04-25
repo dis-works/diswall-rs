@@ -4,14 +4,16 @@ use std::time::Duration;
 use log::{debug, error, info, warn};
 use nats::Connection;
 use sqlite::State;
+use time::OffsetDateTime;
 use crate::Config;
 use crate::config::{PREFIX_BL, PREFIX_WL};
 
 pub const DB_NAME: &str = "diswall.db";
 pub const CREATE_DB: &str = include_str!("../data/create_db.sql");
 pub const CHECK_DB: &str = "SELECT name FROM sqlite_master WHERE type='table' AND name='data';";
-pub const GET_LIST: &str = "SELECT ip FROM data WHERE client=? AND hostname=? AND blacklist=?;";
-pub const ADD_TO_LIST: &str = "INSERT INTO data (client, hostname, blacklist, ip) VALUES (?, ?, ?, ?);";
+pub const GET_LIST: &str = "SELECT ip FROM data WHERE client=? AND hostname=? AND blacklist=? AND until>?;";
+pub const ADD_TO_LIST: &str = "INSERT INTO data (client, hostname, blacklist, ip, until) VALUES (?, ?, ?, ?, ?);";
+pub const GET_UNTIL: &str = "SELECT until FROM data WHERE client=? AND hostname=? AND blacklist=? AND ip=?";
 pub const DELETE_FROM_LIST: &str = "DELETE FROM data WHERE client=? AND hostname=? AND blacklist=? AND ip=?;";
 
 pub fn run_server(config: Config, nats: Option<Connection>) {
@@ -161,6 +163,7 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
 }
 
 fn get_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: bool) -> String {
+    let until = OffsetDateTime::now_utc().unix_timestamp();
     let mut result = String::new();
     let blacklist = match blacklist {
         true => 1,
@@ -171,6 +174,7 @@ fn get_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: bo
             statement.bind(1, client).expect("Error in bind");
             statement.bind(2, hostname).expect("Error in bind");
             statement.bind(3, blacklist).expect("Error in bind");
+            statement.bind(4, until).expect("Error in bind");
             while statement.next().unwrap() == State::Row {
                 if let Ok(string) = statement.read::<String>(0) {
                     if !result.is_empty() {
@@ -188,12 +192,25 @@ fn get_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: bo
 }
 
 fn add_to_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: bool, ip: &str) -> sqlite::Result<State> {
-    let mut statement = db.prepare(ADD_TO_LIST)?;
+    let until = OffsetDateTime::now_utc().unix_timestamp();
+    let mut statement = db.prepare(GET_UNTIL)?;
     statement.bind(1, client)?;
     statement.bind(2, hostname)?;
     statement.bind(3, blacklist as i64)?;
     statement.bind(4, ip)?;
-    statement.next()
+    match statement.next().unwrap() {
+        State::Row => Ok(State::Done),
+        State::Done => {
+            // If we have no record of this IP we add it now
+            let mut statement = db.prepare(ADD_TO_LIST)?;
+            statement.bind(1, client)?;
+            statement.bind(2, hostname)?;
+            statement.bind(3, blacklist as i64)?;
+            statement.bind(4, ip)?;
+            statement.bind(5, until)?;
+            statement.next()
+        }
+    }
 }
 
 fn delete_from_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: bool, ip: &str) -> sqlite::Result<State> {
