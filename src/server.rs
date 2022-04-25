@@ -192,7 +192,7 @@ fn get_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: bo
 }
 
 fn add_to_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: bool, ip: &str) -> sqlite::Result<State> {
-    let until = OffsetDateTime::now_utc().unix_timestamp();
+    let until = OffsetDateTime::now_utc().unix_timestamp() + 86400;
     let mut statement = db.prepare(GET_UNTIL)?;
     statement.bind(1, client)?;
     statement.bind(2, hostname)?;
