@@ -1,0 +1,17 @@
+[Unit]
+Description=Diswall client mode service
+After=network-online.target
+After=diswall-fw-init.service
+Wants=network-online.target
+Wants=diswall-fw-init.service
+
+[Service]
+ProtectHome=true
+ProtectSystem=true
+SyslogIdentifier=diswall
+Restart=always
+Type=simple
+ExecStart=/usr/bin/diswall -c /etc/diswall/diswall.conf
+
+[Install]
+WantedBy=multi-user.target

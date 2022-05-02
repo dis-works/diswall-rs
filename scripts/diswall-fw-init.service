@@ -1,0 +1,8 @@
+[Unit]
+Description=Diswall client mode firewall init service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/diswall-init.sh
