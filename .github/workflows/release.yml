@@ -1,0 +1,84 @@
+on:
+  push:
+    tags: v[0-9].[0-9]+.[0-9]+
+  workflow_dispatch:
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  CARGO_TERM_COLOR: always
+
+name: Releases
+
+jobs:
+
+  get_version:
+    name: Get version from Git tag
+    runs-on: ubuntu-latest
+    outputs:
+      project_version: ${{ env.VERSION }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Getting version
+        run: echo "VERSION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+
+  make_release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: get_version
+    outputs: 
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.get_version.outputs.project_version }}
+        with:
+          tag_name: ${{ env.VERSION }}
+          release_name: ${{ env.VERSION }}
+          body: |
+            ## New
+            * Added new features.
+            ## Bug Fixes & Improvements
+            * Various fixes and stability improvements.
+            ## Documentation & others
+            * Updated documentation.
+          draft: true
+          prerelease: false
+
+  build-and-upload:
+    name: Create and upload builds
+    needs: [ make_release, get_version ]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [ x86_64-unknown-linux-musl, i686-unknown-linux-musl, armv7-unknown-linux-musleabihf, arm-unknown-linux-musleabi, aarch64-unknown-linux-musl ]
+  
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: install dependencies
+        run: |
+          sudo apt update && sudo apt install upx
+          cargo install cross
+          mkdir -p bin
+      - name: Build binaries
+        run: |
+          tag_name="${{ needs.get_version.outputs.project_version }}"
+          cross build --release --target ${{ matrix.arch }}
+          upx target/${{ matrix.arch }}/release/diswall
+          arch=$(echo ${{ matrix.arch }} | cut -d '-' -f 1)
+          cp target/${{ matrix.arch }}/release/diswall ./bin/diswall-v$tag_name-$arch
+      - name: Upload binaries
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag_name="${{ needs.get_version.outputs.project_version }}"
+          hub release edit $(find ./bin -type f -name "diswall-*" -printf "-a %p ") -m "" "$tag_name"
