@@ -358,53 +358,79 @@ fn install_client() -> io::Result<()> {
     use nix::sys::stat;
 
     // Configuring rsyslog
-    fs::create_dir_all("/etc/rsyslog.d/")?;
-    fs::write("/etc/rsyslog.d/10-diswall.conf", include_bytes!("../scripts/10-diswall.conf"))?;
-    info!("Created rsyslogd config file: /etc/rsyslog.d/10-diswall.conf");
+    if !Path::new("/etc/rsyslog.d/10-diswall.conf").exists() {
+        fs::create_dir_all("/etc/rsyslog.d/")?;
+        fs::write("/etc/rsyslog.d/10-diswall.conf", include_bytes!("../scripts/10-diswall.conf"))?;
+        info!("Created rsyslogd config file: /etc/rsyslog.d/10-diswall.conf");
+    } else {
+        info!("Not rewriting rsyslogd config file at: /etc/rsyslog.d/10-diswall.conf");
+    }
     // Adding systemd service for diswall
-    fs::write("/etc/systemd/system/diswall.service", include_bytes!("../scripts/diswall.service"))?;
-    info!("Created systemd service file: /etc/systemd/system/diswall.service");
+    if !Path::new("/etc/systemd/system/diswall.service").exists() {
+        fs::write("/etc/systemd/system/diswall.service", include_bytes!("../scripts/diswall.service"))?;
+        info!("Created systemd service file: /etc/systemd/system/diswall.service");
+    } else {
+        info!("Not rewriting service file: /etc/systemd/system/diswall.service");
+    }
     // Adding systemd service for firewall initialization
-    fs::write("/etc/systemd/system/diswall-fw-init.service", include_bytes!("../scripts/diswall-fw-init.service"))?;
-    info!("Created systemd service file: /etc/systemd/system/diswall-fw-init.service");
+    if !Path::new("/etc/systemd/system/diswall-fw-init.service").exists() {
+        fs::write("/etc/systemd/system/diswall-fw-init.service", include_bytes!("../scripts/diswall-fw-init.service"))?;
+        info!("Created systemd service file: /etc/systemd/system/diswall-fw-init.service");
+    } else {
+        info!("Not rewriting service file: /etc/systemd/system/diswall-fw-init.service");
+    }
     // Creating rsyslog->diswall pipe
-    fs::create_dir_all("/var/log/diswall")?;
-    mkfifo("/var/log/diswall/diswall.pipe", stat::Mode::S_IRWXU)?;
-    info!("Created firewall pipe: /var/log/diswall/diswall.pipe");
+    if !Path::new("/var/log/diswall/diswall.pipe").exists() {
+        fs::create_dir_all("/var/log/diswall")?;
+        mkfifo("/var/log/diswall/diswall.pipe", stat::Mode::S_IRWXU)?;
+        info!("Created firewall pipe: /var/log/diswall/diswall.pipe");
+    } else {
+        info!("Not rewriting pipe at: /var/log/diswall/diswall.pipe");
+    }
     // Creating a config for diswall
-    fs::create_dir_all("/etc/diswall/")?;
-    fs::write("/etc/diswall/diswall.conf", include_bytes!("../config/diswall.toml"))?;
-    info!("Created config file: /etc/diswall/diswall.conf");
+    if !Path::new("/etc/diswall/diswall.conf").exists() {
+        fs::create_dir_all("/etc/diswall/")?;
+        fs::write("/etc/diswall/diswall.conf", include_bytes!("../config/diswall.toml"))?;
+        info!("Created config file: /etc/diswall/diswall.conf");
+    } else {
+        info!("Not rewriting config file: /etc/diswall/diswall.conf");
+    }
 
     // Copying this binary to /usr/bin
     let exe_path = std::env::current_exe()?;
-    fs::copy(exe_path, "/usr/bin/diswall")?;
-
-    let services = get_listening_services();
-    let mut buffer = String::new();
-    for service in services {
-        if service.dst_addr.ip().is_loopback() {
-            continue;
-        }
-        if !buffer.is_empty() {
-            buffer.push('\n');
-        }
-        let s = if service.src_addr.ip().is_unspecified() {
-            format!("iptables -A INPUT -p {} --dport {} -m comment --comment \"{}\" -j ACCEPT", &service.protocol, service.dst_addr.port(), &service.name)
-        } else {
-            format!("iptables -A INPUT -s {} -p {} --dport {} -m comment --comment \"{}\" -j ACCEPT", &service.src_addr.ip(), &service.protocol, service.dst_addr.port(), &service.name)
-        };
-        buffer.push_str(&s);
+    if !exe_path.eq(Path::new("/usr/bin/diswall")) {
+        fs::copy(exe_path, "/usr/bin/diswall")?;
     }
-    let script_content = include_str!("../scripts/diswall_init.sh").replace("#diswall_init_rules", &buffer);
 
-    let path = Path::new("/usr/bin/diswall_init.sh");
-    match File::create(&path) {
-        Ok(mut f) => {
-            f.write_all(script_content.as_bytes()).expect("Error saving script to /usr/bin/diswall_init.sh");
-            set_permissions(&path, Permissions::from_mode(0700))?;
+    if !Path::new("/usr/bin/diswall_init.sh").exists() {
+        let services = get_listening_services();
+        let mut buffer = String::new();
+        for service in services {
+            if service.dst_addr.ip().is_loopback() {
+                continue;
+            }
+            if !buffer.is_empty() {
+                buffer.push('\n');
+            }
+            let s = if service.src_addr.ip().is_unspecified() {
+                format!("iptables -A INPUT -p {} --dport {} -m comment --comment \"{}\" -j ACCEPT", &service.protocol, service.dst_addr.port(), &service.name)
+            } else {
+                format!("iptables -A INPUT -s {} -p {} --dport {} -m comment --comment \"{}\" -j ACCEPT", &service.src_addr.ip(), &service.protocol, service.dst_addr.port(), &service.name)
+            };
+            buffer.push_str(&s);
         }
-        Err(e) => error!("Error saving script to /usr/bin/diswall_init.sh: {}", e)
+        let script_content = include_str!("../scripts/diswall_init.sh").replace("#diswall_init_rules", &buffer);
+
+        let path = Path::new("/usr/bin/diswall_init.sh");
+        match File::create(&path) {
+            Ok(mut f) => {
+                f.write_all(script_content.as_bytes()).expect("Error saving script to /usr/bin/diswall_init.sh");
+                set_permissions(&path, Permissions::from_mode(0700))?;
+            }
+            Err(e) => error!("Error saving script to /usr/bin/diswall_init.sh: {}", e)
+        }
+    } else {
+        info!("Not rewriting firewall init script: /usr/bin/diswall_init.sh");
     }
 
     info!("Installation complete!");
