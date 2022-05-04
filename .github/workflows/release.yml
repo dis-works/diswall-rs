@@ -75,7 +75,7 @@ jobs:
           cross build --release --target ${{ matrix.arch }}
           upx target/${{ matrix.arch }}/release/diswall
           arch=$(echo ${{ matrix.arch }} | cut -d '-' -f 1)
-          cp target/${{ matrix.arch }}/release/diswall ./bin/diswall-v$tag_name-$arch
+          cp target/${{ matrix.arch }}/release/diswall ./bin/diswall-$tag_name-$arch
       - name: Upload binaries
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
