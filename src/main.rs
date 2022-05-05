@@ -13,6 +13,8 @@ use ipset::ipset_list_exists;
 use crate::config::Config;
 use crate::ipset::{ipset_list_create_bl, ipset_list_create_wl};
 use crate::server::run_server;
+#[cfg(not(windows))]
+use crate::install::install_client;
 
 mod config;
 mod ipset;
