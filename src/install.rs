@@ -5,12 +5,12 @@ use std::net::SocketAddrV4;
 use std::io::Read;
 use std::str::FromStr;
 use std::os::unix::fs::PermissionsExt;
-use std::fs::{File, OpenOptions, Permissions, set_permissions};
+use std::fs::{File, Permissions, set_permissions};
 use log::{error, info, warn};
 use nix::unistd::mkfifo;
 
 #[cfg(not(windows))]
-fn install_client() -> io::Result<()> {
+pub(crate) fn install_client() -> io::Result<()> {
     use std::fs;
     use nix::sys::stat;
     use std::path::Path;
