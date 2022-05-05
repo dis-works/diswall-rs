@@ -13,7 +13,7 @@ use getopts::{Matches, Options};
 use log::{debug, error, info, LevelFilter, warn};
 use nats::Connection;
 use nix::unistd::mkfifo;
-use simplelog::{ColorChoice, CombinedLogger, ConfigBuilder, LevelPadding, TerminalMode, TermLogger, WriteLogger};
+use simplelog::{ColorChoice, CombinedLogger, ConfigBuilder, format_description, LevelPadding, TerminalMode, TermLogger, WriteLogger};
 use ipset::ipset_list_exists;
 use crate::config::Config;
 use crate::ipset::{ipset_list_create_bl, ipset_list_create_wl};
@@ -320,10 +320,11 @@ fn setup_logger(opt_matches: &Matches) {
         .set_thread_level(LevelFilter::Error)
         .set_location_level(LevelFilter::Off)
         .set_target_level(LevelFilter::Error)
-        .set_time_level(LevelFilter::Error)
-        .set_time_format_str("%F %T%.3f")
-        .set_time_to_local(true)
         .set_level_padding(LevelPadding::Right)
+        .set_time_level(LevelFilter::Error)
+        .set_time_format_custom(format_description!("[hour]:[minute]:[second].[subsecond]"))
+        .set_time_offset_to_local()
+        .unwrap()
         .build();
     match opt_matches.opt_str("log") {
         None => {
