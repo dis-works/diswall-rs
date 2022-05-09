@@ -1,100 +1,135 @@
-[![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/dis-works/diswall)](https://github.com/dis-works/diswall/releases/latest) [![CodeQL](https://github.com/dis-works/diswall/actions/workflows/codeql-analysis.yml/badge.svg)](https://github.com/dis-works/diswall/actions/workflows/codeql-analysis.yml) [![Go Report Card](https://goreportcard.com/badge/github.com/dis-works/diswall)](https://goreportcard.com/report/github.com/dis-works/diswall)
+[![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/dis-works/diswall-rs)](https://github.com/dis-works/diswall-rs/releases/latest) [![CodeQL](https://github.com/dis-works/diswall-rs/actions/workflows/release.yml/badge.svg)](https://github.com/dis-works/diswall-rs/actions/workflows/release.yml)
 
-- [Описание](#diswall-альфа-версия)
+- [Description](#diswall-alfa-version)
 - [ipset](#ipset)
 - [NATS](#nats)
-- [Опции](#опции)
-- [Установка своего сервера](#установка-своего-сервера)
-- [Автономная работа](#автономная-работа)
-- [Сбор данных](#сбор-данных)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Installing your own server](#own-server-installation)
+- [Autonomous](#autonomous-work)
+- [Data collection](#data-collection)
 
-# diswall (альфа-версия!)
+# diswall (alfa version!)
 
-diswall (distributed firewall) - клиент распределённого сетевого фильтра работающий на множестве серверов и использующий [NATS](https://nats.io) в качестве транспорта. Его цель - максимально быстрая блокировка IP на всех защищаемых серверах при его обращении на закрытый порт любого из этих серверов. Таким образом diswall обеспечивает защиту от сканирования всей инфраструктуры (анти-shodan) не давая злоумышленнику возможности собрать информацию о системе.
+diswall (distributed firewall) - a client of distributed firewall working on many servers and using [NATS](https://nats.io) for the transport level.
+Its purpose - blocking IPs with a blink of the eye on all servers in any infrastructure when some IP checks any of the closed ports of anyone of these servers.
+Therefore, diswall provides good protection of whole infrastructure (as anti-shodan) preventing intruder to get any system information.
 
-В качестве источника "плохих" адресов используется запись пакетов в iptables. Однако в будущем возможно использовать и другие источники (например журналы WAF). Благодаря использованию шаблонов rsyslog из сообщений ядра выбирается только IP, другая информация из журналов никак не используется и никуда не отправляется. Каждый обнаруженный IP заносится в чёрный список при помощи ipset и возможное открытое соединение с ним обрывается (что бы предотвратить нежелательную активность с открытыми портами, например эксплуатацию веб-уязвимости). Одновременно с этим при помощи NATS IP посылается на центральный сервер (https://diswall.stream) откуда передаётся всем клиентам diswall'а.
+The source of these "bad" IP-addresses is iptables log. But it is possible to use other sources in future (for example logs of WAF).
+Thanks to log templates of rsyslog only IP is extracted from kernel, no other info is extracted from logs and is not sent anywhere.
+All acquired IPs are added to a list in ipset and any open connection with that IP is closed (to prevent any interaction with open ports, for example exploitation of web-based vulnerability).
+This IP is simultaneously sent through NATS to the central server (https://diswall.stream) and is distributed to all other diswall clients.
 
-Аналогичным образом имеется возможность распространять белые списки, для удобства настройки сетевого фильтра на серверах. В отличие от чёрного списка - белый для каждого клиента является уникальным, поддерживает комментарии и добавление целых подсетей.
+You can use the same approach to distribute allowed IPs as a convenient way to control firewalls on your servers.
+In contrast to blocklist allowlist is unique for every client, it supports comments and can store whole networks.
 
-Каждый добавленный в чёрный список IP хранится в течение суток, а в белом списке - без ограничений по времени. Имеется возможность удалить адрес из любого списка.
+Every IP that is added to blocklist is stored for a day, but IPs in allowlist are stored indefinitely. Deletion of IPs is also possible.
 
-При загрузке сервера - клиент diswall получает текущие актуальные копии чёрных и белых списков. Это позволяет обеспечить защищённость с учётом событий произошедших на других серверах пока текущий был в отключённом состоянии.
+When your server is started diswall client currently actual block and allow lists.
+This provides protection in accordance with any events that occurred on other servers when any of them was offline.
 
 # ipset
 
-diswall использует два списка ipset - для заблокированных и разрешённых адресов. Имена по-умолчанию - `diswall-bl` и `diswall-wl` соответственно. Белый список создаётся командой `ipset create -exist diswall-wl hash:net comment`. Он позволяет добавлять записи подсетями и использовать комментарии. Чёрный список создаётся командой `ipset create -exist diswall-bl hash:ip hashsize 32768 maxelem 1000000 timeout 86400`. Он позволяет добавлять только по 1 IP и не поддерживает комментарии. Срок жизни записи в чёрном списке ограничен 1 сутками. Максимальное кол-во записей в чёрном списке - 1 000 000, в белом - 65 536.
+diswall uses two ipset lists - for blocked addresses and allowed ones. Default names are - `diswall-bl` and `diswall-wl` respectively.
+
+Allow list is created by `ipset create -exist diswall-wl hash:net comment` command.
+It allows usage of whole networks and adding comments for every record.
+
+Block list is created by `ipset create -exist diswall-bl hash:ip hashsize 32768 maxelem 1000000 timeout 86400` command.
+It allows adding only individual IPs and doesn't support comments.
+
+The lifetime of IP in blocklist is 1 day (24 hours). Maximum number of records in blocklist is 1 000 000 (one million), in allowlist - 65 536.
 
 # NATS
 
-По-умолчанию используются следующие темы для публикации IP, однако клиент diswall'а позволяет задавать свои:
-- diswall.whitelist.<имя_клиента> - для добавления адреса в белый список;
-- diswall.whitelist.<имя_клиента>.del - для удаления адреса из белого списка;
-- diswall.blacklist - для добавления адреса в чёрный список;
-- diswall.blacklist.del - для удаления адреса из чёрного списка.
+By default, these subjects are used for IP publishing:
+- `diswall.whitelist.<client_name>.add.<hostname>` - to add some IP to allowlist;
+- `diswall.whitelist.<client_name>.del.<hostname>` - to remove IP from allowlist;
+- `diswall.blacklist.<client_name>.add.<hostname>` - to add some IP to blocklist;
+- `diswall.blacklist.<client_name>.del.<hostname>` - to remove IP from blocklist.
 
-Кроме того имеются две специальные темы - `diswall.blacklist.init` и `diswall.whitelist.init`. Они использутся для начальной инициализации списков при старте системы.
+Also, there are two special subject - `diswall.blacklist.<client_name>.init.<hostname>` и `diswall.whitelist.<client_name>.init.<hostname>`.
+They are used for initialization of the system (populating diswall-bl and diswall-wl lists).
+But the most important subject is `diswall.blacklist.new` - the server, that is accumulating the IPs is sending all IPs to block with this subject.
 
-Клиент diswall'а можно использовать и для отправки сообщений вручную, например для удаления адреса из чёрного списка, либо добавления в белый. В последнем случае к записи можно добавить комментарий - он объединяются с данными через `|`.
+# Installation
 
-# Опции
+The simplest way to install diswall on your server is to use autoinstall functionality in diswall itself.
+1. Download binary for your architecture: `wget -O diswall https://github.com/dis-works/diswall-rs/releases/download/v0.1.0/diswall-v0.1.0-x86_64`
+2. Make it executable: `chmod +x diswall`
+3. Run installation: `./diswall --install`
 
-Конфигурация хранится в `/etc/diswall.toml`. Кроме того могут использоваться параметры командной строки. Большинство из них может переопределить значение из конфигурационного файла, но имеется несколько уникальных.
+This will copy the binary to `/usr/bin`, create systemd service, diswall config (`/etc/diswall/diswall.conf`)
+and iptables initialization script `/usr/bin/diswall_init.sh`.
 
-| Параметр командной строки | Соответствие в конф. файле | Описание | Значение по-умолчанию |
-| - | - | - | - |
-| -pipe | pipePath | путь к именованному каналу, куда rsyslog записывает IP от iptables | "/var/log/diswall/diswall.pipe" |
-| -server | server | адрес центрального сервера diswall | "diswall.stream" |
-| -port | port | порт центрального сервера diswall | 4222 |
-| -name | clientName | имя пользователя для подключения | — |
-| -password | clientPass | пароль пользователя для подключения | — |
-| -localonly | localonly | работать автономно, без подключения к серверу | false |
-| -wl-ipset | wlIpset | имя списка ipset для разрешённых IP | "diswall-wl" |
-| -bl-ipset | blIpset | имя списка ipset для блокируемых IP | "diswall-bl" |
-| -wl-subj | wlAddSubj | тема для публикации добавляемых в БС IP | —* |
-| -bl-subj | blAddSubj | тема для публикации добавляемых в ЧС IP | "diswall.blacklist" |
-| -wl-del-subj | wlDelSubj | тема для публикации удаляемых из БС IP | —* |
-| -bl-del-subj | blDelSubj | тема для публикации удаляемых из ЧС IP | "diswall.blacklist.del" |
-| -wl-add-ip** | — | добавить указанный IP в БС | — |
-| -wl-add-comm** | — | опциональный комментарий ipset для добавляемого в БС IP | — |
-| -wl-del-ip** | — | удалить указанный IP из БС | — |
-| -bl-del-ip** | — | удалить указанный IP из ЧС | — |
+Take a look into these files, enter client login and password in first, and add your iptables rules in the second.
 
-\* Если эти параметры не заданы, то их значение генерируется автоматически на основе имени клиента.
+# Configuration
 
-\*\* Если заданы эти параметры, то diswall только публикует данные и завершает работу. Все сообщения при этом идут только в STDOUT, файл журнала не используется. Опции могут быть заданы вместе, но каждой может быть передан лишь 1 адрес.
+Configuration file is located at `/etc/diswall/diswall.conf`. It's format is TOML.
+Also, you can use command line arguments listed below.
 
-# Установка своего сервера
+```text
+    -h, --help                Print this help menu
+    -v, --version             Print version and exit
+        --install             Install DisWall as system service (in client mode)
+    -d, --debug               Show trace messages, more than debug
+    -g, --generate            Generate fresh configuration file. It is better to redirect contents to file.
+    -c, --config FILE         Set configuration file path
+        --log FILE            Set log file path
+    -f, --pipe-file FILE      Named pipe from which to fetch IPs
+    -s, --nats-server DOMAIN  NATS server name
+    -P, --port PORT           NATS server port
+    -n, --name NAME           NATS client name (login)
+    -p, --pass PASSWORD       NATS password
+    -l, --local-only          Don't connect to NATS server, work only locally
+    -a, --allow-list          Allow list name
+    -b, --block-list          Block list name
+        --wl-add-ip IP        Add this IP to allow list
+        --wl-add-comm COMMENT Comment to add with IP to allow list
+        --wl-del-ip IP        Remove IP from allow list
+        --bl-del-ip IP        Remove IP from block list
+    -k, --kill                Kill already established connection using `ss -K`
+        --server              Start diswall NATS server to handle init messages.
+```
 
-Для того что бы использовать свой сервер diswall'а, необходимо установить NATS и скрипт для отдачи списков IP серверам при их загрузке. Инструкция с различными вариантами установки NATS'а есть в официальной [документации](https://docs.nats.io/nats-server/installation). После установки требуется настроить права доступа: пример приведён ниже, а полное руководство - в [документации](https://docs.nats.io/nats-server/configuration/securing_nats/authorization):
+# Own server installation
+
+To install and host your own diswall server, you need to install NATS and start diswall in `--server` mode.
+You can find NATS installation instructions in [documentation](https://docs.nats.io/nats-server/installation).
+After installation, you need to adjust permissions: example is below, and more examples are in [documentation](https://docs.nats.io/nats-server/configuration/securing_nats/authorization):
 
 ```
 $ cat /etc/nats.conf
 ...
 authorization {
   default_permissions = {
-    subscribe = ["diswall.blacklist.init", "diswall.blacklist"]
+    subscribe = ["diswall.blacklist.init", "diswall.blacklist.new"]
   }
-  DW_INIT = {
+  DW_SERVER = {
     publish = "_INBOX.>"
-    subscribe = ["diswall.blacklist.init", "diswall.whitelist.init"]
+    subscribe = ["diswall.blacklist.*", "diswall.whitelist.*"]
   }
-  MY_NET = {
-    publish = ["diswall.blacklist.init", "diswall.whitelist.init", "diswall.blacklist", "diswall.whitelist.my_net", "diswall.blacklist.del", "diswall.whitelist.my_net.del"]
-    subscribe = ["_INBOX.>", "diswall.blacklist", "diswall.whitelist.my_net", "diswall.blacklist.del", "diswall.whitelist.my_net.del"]
+  USER1 = {
+    publish = ["diswall.blacklist.client1.*", "diswall.whitelist.client1.*"]
+    subscribe = ["_INBOX.>", "diswall.blacklist.new", "diswall.whitelist.client1", "diswall.whitelist.client1"]
   }
   users = [
-    {user: dw_init,   password: "QuodLicetJovi",   permissions: $DW_INIT}
-    {user: my_net,  password: "NonLicetBovi",   permissions: $MY_NET}
+    {user: dw_server,   password: "QuodLicetJovi",   permissions: $DW_SERVER}
+    {user: client1,  password: "NonLicetBovi",   permissions: $USER1}
   ]
 }
 ```
 
-Пароль пользователя dw_init и имя сервера нужно задать в скрипте [diswall-init.go](diswall-init/diswall-init.go), после чего скомпилировать командой `go build diswall-init.go` и обеспечить автозагрузку полученного файла. Этот скрипт позволяет из различных имеющихся белых списков выбрать тот, который относится к обратившемуся клиенту, основываясь на его имени. Соответственно, для примера выше, необходимо создать белый список с именем `diswall-wl-my_net`: `ipset create -exist diswall-wl-my_net hash:net comment`.
+You will need to create separate config file: `diswall -g > /etc/diswall/diswall-server.conf` and create separate systemd unit to run `/usr/bin/diswall -c /etc/diswall/diswall/diswall-server.conf`.
+Make sure you set the client name in this config to `dw_server` and use appropriate password.
+And don't forget to set `server_mode = true`.
 
-# Автономная работа
+# Autonomous work
 
-Клиент diswall'а может работать и локально, без подключения к серверам. Этот режим работы активируется параметром `localonly`. В таком случае diswall будет по-прежнему блокировать IP основываясь на журнале iptables, но не будет устанавливать соединение с сервером и, следовательно, передавать/принимать данные.
+If you don't want diswall to work as _distributed_ firewall you can start it in local only mode, just set `localonly = true` in config file.
+In this case it will block all IPs that it gets from iptables log file without connection to NATS server.
 
-# Сбор данных
+# Data collection
 
-При добавлении IP в чёрный список отправляется имя узла который передал адрес, эта информация доступна всем клиентам.
+If your node blocks some IP it will send bad IP to NATS server, and this IP will be added to bad IPs database.
