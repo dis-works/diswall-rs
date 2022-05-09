@@ -9,9 +9,9 @@
 - [Autonomous](#autonomous-work)
 - [Data collection](#data-collection)
 
-# diswall (alfa version!)
+# DisWall (alfa version!)
 
-diswall (distributed firewall) - a client of distributed firewall working on many servers and using [NATS](https://nats.io) for the transport level.
+Diswall (distributed firewall) - a client of distributed firewall working on many servers and using [NATS](https://nats.io) for the transport level.
 Its purpose - blocking IPs with a blink of the eye on all servers in any infrastructure when some IP checks any of the closed ports of anyone of these servers.
 Therefore, diswall provides good protection of whole infrastructure (as anti-shodan) preventing intruder to get any system information.
 
@@ -30,7 +30,7 @@ This provides protection in accordance with any events that occurred on other se
 
 # ipset
 
-diswall uses two ipset lists - for blocked addresses and allowed ones. Default names are - `diswall-bl` and `diswall-wl` respectively.
+Diswall uses two ipset lists - for blocked addresses (`diswall-bl`) and allowed ones (`diswall-wl`).
 
 Allow list is created by `ipset create -exist diswall-wl hash:net comment` command.
 It allows usage of whole networks and adding comments for every record.
@@ -70,27 +70,27 @@ Configuration file is located at `/etc/diswall/diswall.conf`. It's format is TOM
 Also, you can use command line arguments listed below.
 
 ```text
-    -h, --help                Print this help menu
-    -v, --version             Print version and exit
-        --install             Install DisWall as system service (in client mode)
-    -d, --debug               Show trace messages, more than debug
-    -g, --generate            Generate fresh configuration file. It is better to redirect contents to file.
-    -c, --config FILE         Set configuration file path
-        --log FILE            Set log file path
-    -f, --pipe-file FILE      Named pipe from which to fetch IPs
-    -s, --nats-server DOMAIN  NATS server name
-    -P, --port PORT           NATS server port
-    -n, --name NAME           NATS client name (login)
-    -p, --pass PASSWORD       NATS password
-    -l, --local-only          Don't connect to NATS server, work only locally
-    -a, --allow-list          Allow list name
-    -b, --block-list          Block list name
-        --wl-add-ip IP        Add this IP to allow list
-        --wl-add-comm COMMENT Comment to add with IP to allow list
-        --wl-del-ip IP        Remove IP from allow list
-        --bl-del-ip IP        Remove IP from block list
-    -k, --kill                Kill already established connection using `ss -K`
-        --server              Start diswall NATS server to handle init messages.
+-h, --help                Print this help menu
+-v, --version             Print version and exit
+    --install             Install DisWall as system service (in client mode)
+-d, --debug               Show trace messages, more than debug
+-g, --generate            Generate fresh configuration file. It is better to redirect contents to file.
+-c, --config FILE         Set configuration file path
+    --log FILE            Set log file path
+-f, --pipe-file FILE      Named pipe from which to fetch IPs
+-s, --nats-server DOMAIN  NATS server name
+-P, --port PORT           NATS server port
+-n, --name NAME           NATS client name (login)
+-p, --pass PASSWORD       NATS password
+-l, --local-only          Don't connect to NATS server, work only locally
+-a, --allow-list          Allow list name
+-b, --block-list          Block list name
+    --wl-add-ip IP        Add this IP to allow list
+    --wl-add-comm COMMENT Comment to add with IP to allow list
+    --wl-del-ip IP        Remove IP from allow list
+    --bl-del-ip IP        Remove IP from block list
+-k, --kill                Kill already established connection using `ss -K`
+    --server              Start diswall NATS server to handle init messages.
 ```
 
 # Own server installation
