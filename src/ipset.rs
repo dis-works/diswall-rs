@@ -3,7 +3,7 @@ use std::io::Write;
 #[allow(unused_imports)]
 use log::{debug, error, info, warn};
 
-pub fn run_ipset(action: &str, list_name: &str, data: &str, comment: Option<&str>) {
+pub fn run_ipset(action: &str, list_name: &str, data: &str, comment: Option<String>) {
     let data = data.trim();
     if action == "restore" {
         let command = Command::new("ipset")
@@ -21,7 +21,7 @@ pub fn run_ipset(action: &str, list_name: &str, data: &str, comment: Option<&str
     } else {
         let mut command = Command::new("ipset");
         let command = match comment {
-            Some(comment) => command.args(vec!["-exist", action, list_name, data, "comment", comment]),
+            Some(comment) => command.args(vec!["-exist", action, list_name, data, "comment", &comment]),
             None => command.args(vec!["-exist", action, list_name, data])
         };
         match command.spawn() {

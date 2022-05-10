@@ -91,6 +91,10 @@ fn main() -> Result<(), i32> {
                 return Err(1);
             }
             Ok(nats) => {
+                let nats_clone = Some(nats.clone());
+                if process_ips_from_parameters(&config, &opt_matches, nats_clone) {
+                    return Ok(());
+                }
                 if !config.server_mode {
                     info!("Connected to NATS server, setting up handlers");
                     start_nats_handlers(&mut config, &nats);
@@ -99,6 +103,9 @@ fn main() -> Result<(), i32> {
             }
         }
     } else {
+        if process_ips_from_parameters(&config, &opt_matches, None) {
+            return Ok(());
+        }
         None
     };
 
@@ -128,6 +135,34 @@ fn main() -> Result<(), i32> {
         error!("Error reading pipe: {}", e);
     }
     Ok(())
+}
+
+fn process_ips_from_parameters(config: &Config, opt_matches: &Matches, nats: Option<Connection>) -> bool {
+    if let Some(ip) = opt_matches.opt_str("wl-add-ip") {
+        let comment = match opt_matches.opt_str("wl-add-comm") {
+            None => None,
+            Some(s) => Some(s)
+        };
+        modify_list(true, &nats, &config.ipset_white_list, &config.nats.wl_add_subject, &ip, comment);
+        return true;
+    }
+
+    if let Some(ip) = opt_matches.opt_str("wl-del-ip") {
+        modify_list(false, &nats, &config.ipset_white_list, &config.nats.wl_del_subject, &ip, None);
+        return true;
+    }
+
+    if let Some(ip) = opt_matches.opt_str("bl-add-ip") {
+        modify_list(true, &nats, &config.ipset_black_list, &config.nats.bl_add_subject, &ip, None);
+        return true;
+    }
+
+    if let Some(ip) = opt_matches.opt_str("bl-del-ip") {
+        modify_list(true, &nats, &config.ipset_black_list, &config.nats.bl_del_subject, &ip, None);
+        return true;
+    }
+
+    false
 }
 
 fn start_nats_handlers(config: &mut Config, nats: &Connection) {
@@ -169,7 +204,7 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection) {
                     ipset::run_ipset("add", &list_name, split[0], None);
                 } else {
                     debug!("Got IP for whitelist: {} ({})", split[0], split[1]);
-                    ipset::run_ipset("add", &list_name, split[0], Some(split[1]));
+                    ipset::run_ipset("add", &list_name, split[0], Some(split[1].to_owned()));
                 }
             }
             Ok(())
@@ -241,27 +276,35 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>) -> Result<Infallible, 
         let len = reader.read_line(&mut line)?;
         if len > 0 {
             debug!("Got new IP: {}", line.trim());
-            if let Ok(addr) = line.trim().parse::<IpAddr>() {
-                match addr {
-                    IpAddr::V4(ip) => {
-                        if !ip.is_private() && !ip.is_loopback() && !ip.is_unspecified() {
-                            debug!("Adding {} to {}", &line.trim(), config.ipset_black_list.as_str());
-                            ipset::run_ipset("add", &block_list, line.trim(), None);
-                            push_to_nats(&nats, &config.nats.bl_add_subject, ip.to_string());
-                        }
-                    }
-                    IpAddr::V6(ip) => {
-                        if !ip.is_loopback() && !ip.is_unspecified() {
-                            debug!("Adding {} to {}", &line.trim(), config.ipset_black_list.as_str());
-                            ipset::run_ipset("add", &block_list, line.trim(), None);
-                            push_to_nats(&nats, &config.nats.bl_add_subject, ip.to_string());
-                        }
-                    }
-                }
-            }
+            modify_list(true, &nats, &block_list, &config.nats.bl_add_subject, line.trim(), None);
             line.clear();
         } else {
             thread::sleep(delay);
+        }
+    }
+}
+
+fn modify_list(add: bool, nats: &Option<Connection>, list: &str, subject: &str, line: &str, comment: Option<String>) {
+    let action = match add {
+        true => "add",
+        false => "del"
+    };
+    if let Ok(addr) = line.parse::<IpAddr>() {
+        match addr {
+            IpAddr::V4(ip) => {
+                if !ip.is_private() && !ip.is_loopback() && !ip.is_unspecified() {
+                    debug!("{} {} to/from {}", action, line, list);
+                    ipset::run_ipset(action, &list, line, comment);
+                    push_to_nats(&nats, subject, ip.to_string());
+                }
+            }
+            IpAddr::V6(ip) => {
+                if !ip.is_loopback() && !ip.is_unspecified() {
+                    debug!("{} {} to/from {}", action, line, list);
+                    ipset::run_ipset(action, &list, line, comment);
+                    push_to_nats(&nats, subject, ip.to_string());
+                }
+            }
         }
     }
 }
@@ -302,6 +345,7 @@ fn get_options(args: &Vec<String>) -> (Options, Matches) {
     opts.optopt("", "wl-add-ip", "Add this IP to allow list", "IP");
     opts.optopt("", "wl-add-comm", "Comment to add with IP to allow list", "COMMENT");
     opts.optopt("", "wl-del-ip", "Remove IP from allow list", "IP");
+    opts.optopt("", "bl-add-ip", "Add this IP to block list", "IP");
     opts.optopt("", "bl-del-ip", "Remove IP from block list", "IP");
 
     opts.optflag("k", "kill", "Kill already established connection using `ss -K`");
