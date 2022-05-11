@@ -88,6 +88,7 @@ Also, you can use command line arguments listed below.
     --wl-add-ip IP        Add this IP to allow list
     --wl-add-comm COMMENT Comment to add with IP to allow list
     --wl-del-ip IP        Remove IP from allow list
+    --bl-add-ip IP        Add this IP to block list
     --bl-del-ip IP        Remove IP from block list
 -k, --kill                Kill already established connection using `ss -K`
     --server              Start diswall NATS server to handle init messages.

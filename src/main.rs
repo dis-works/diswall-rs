@@ -3,7 +3,7 @@ use std::{env, io, thread};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::net::{IpAddr};
-use std::process::exit;
+use std::process::{Command, exit};
 use std::time::Duration;
 use getopts::{Matches, Options};
 use log::{debug, error, info, LevelFilter, warn};
@@ -42,6 +42,13 @@ fn main() -> Result<(), i32> {
     if opt_matches.opt_present("g") {
         println!("{}", include_str!("../config/diswall.toml"));
         return Ok(());
+    }
+
+    if let Some(ip) = opt_matches.opt_str("k") {
+        if kill_connection(&ip) {
+            println!("Killed connection with {}", &ip);
+        }
+        return Ok(())
     }
 
     let file_name = match opt_matches.opt_str("c") {
@@ -154,6 +161,7 @@ fn process_ips_from_parameters(config: &Config, opt_matches: &Matches, nats: Opt
 
     if let Some(ip) = opt_matches.opt_str("bl-add-ip") {
         modify_list(true, &nats, &config.ipset_black_list, &config.nats.bl_add_subject, &ip, None);
+        let _ = kill_connection(&ip);
         return true;
     }
 
@@ -218,6 +226,7 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection) {
         sub.with_handler(move |message| {
             if let Ok(string) = String::from_utf8(message.data) {
                 ipset::run_ipset("add", &list_name, &string, None);
+                let _ = kill_connection(&string);
             }
             Ok(())
         });
@@ -230,6 +239,7 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection) {
         sub.with_handler(move |message| {
             if let Ok(string) = String::from_utf8(message.data) {
                 ipset::run_ipset("add", &list_name, &string, None);
+                let _ = kill_connection(&string);
             }
             Ok(())
         });
@@ -403,4 +413,27 @@ fn setup_logger(opt_matches: &Matches) {
             }
         }
     }
+}
+
+pub fn kill_connection(ip: &str) -> bool {
+    if ip.parse::<IpAddr>().is_err() {
+        error!("Can not parse IP address from {}", ip);
+        return false;
+    }
+
+    let command = Command::new("ss")
+        .arg("-K")
+        .arg("dst")
+        .arg(ip)
+        .spawn();
+    match command {
+        Ok(mut child) => {
+            match child.wait() {
+                Ok(status) => return status.success(),
+                Err(e) => error!("Error running ss: {}", e)
+            }
+        }
+        Err(e) => error!("Error running ss: {}", e)
+    }
+    false
 }
