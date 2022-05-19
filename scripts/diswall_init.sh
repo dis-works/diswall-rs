@@ -10,6 +10,8 @@ iptables -F INPUT
 # Allow all localhost and related connections:
 iptables -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 iptables -A INPUT -i lo -j ACCEPT
+# For rare conditions
+iptables -A OUTPUT -p udp -m state --state NEW,ESTABLISHED -j ACCEPT
 
 # Allow all IPs from diswall-wl
 iptables -A INPUT -m set --match-set diswall-wl src -j ACCEPT
