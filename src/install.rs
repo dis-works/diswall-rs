@@ -1,7 +1,7 @@
 use std::io;
 use std::collections::HashSet;
 use std::process::{Command, Stdio};
-use std::net::SocketAddrV4;
+use std::net::SocketAddr;
 use std::io::Read;
 use std::str::FromStr;
 use std::os::unix::fs::PermissionsExt;
@@ -68,14 +68,17 @@ pub(crate) fn install_client() -> io::Result<()> {
             if service.dst_addr.ip().is_loopback() {
                 continue;
             }
+            let s = if service.src_addr.ip().is_unspecified() {
+                format!("iptables -A INPUT -p {} --dport {} -m comment --comment \"{}\" -j ACCEPT", &service.protocol, service.dst_addr.port(), &service.name)
+            } else if service.src_addr.ip().is_ipv4() {
+                // We work with IPv4 only for now
+                format!("iptables -A INPUT -s {} -p {} --dport {} -m comment --comment \"{}\" -j ACCEPT", &service.src_addr.ip(), &service.protocol, service.dst_addr.port(), &service.name)
+            } else {
+                continue;
+            };
             if !buffer.is_empty() {
                 buffer.push('\n');
             }
-            let s = if service.src_addr.ip().is_unspecified() {
-                format!("iptables -A INPUT -p {} --dport {} -m comment --comment \"{}\" -j ACCEPT", &service.protocol, service.dst_addr.port(), &service.name)
-            } else {
-                format!("iptables -A INPUT -s {} -p {} --dport {} -m comment --comment \"{}\" -j ACCEPT", &service.src_addr.ip(), &service.protocol, service.dst_addr.port(), &service.name)
-            };
             buffer.push_str(&s);
         }
         let script_content = include_str!("../scripts/diswall_init.sh").replace("#diswall_init_rules", &buffer);
@@ -103,14 +106,14 @@ pub(crate) fn install_client() -> io::Result<()> {
 fn get_listening_services() -> HashSet<Service> {
     let mut result = HashSet::new();
 
-    match Command::new("ss").arg("-4nlptuH").stdout(Stdio::piped()).spawn() {
+    match Command::new("ss").arg("-nlptuH").stdout(Stdio::piped()).spawn() {
         Ok(mut child) => {
             let mut buffer = String::new();
             let mut io = child.stdout.take().unwrap();
             match io.read_to_string(&mut buffer) {
                 Ok(size) => {
                     if size == 0 {
-                        warn!("Result of 'ss -4nlptuH' is zero!");
+                        warn!("Result of 'ss -nlptuH' is zero!");
                         return result;
                     }
                     let buffer = reduce_spaces(&buffer)
@@ -121,24 +124,25 @@ fn get_listening_services() -> HashSet<Service> {
                     for line in buffer.split("\n") {
                         let parts = line.split(" ").collect::<Vec<_>>();
                         if parts.len() < 6 {
-                            warn!("Error parsing 'ss -4nlptuH' output!");
+                            warn!("Error parsing 'ss -nlptuH' output!");
                             return result;
                         }
 
                         let protocol = String::from(parts[0]);
-                        let dst_addr = match SocketAddrV4::from_str(parts[4]) {
+                        let dst_addr = parts[4].replace("*:", "0.0.0.0:");
+                        let dst_addr = match SocketAddr::from_str(&dst_addr) {
                             Ok(addr) => addr,
                             Err(e) => {
-                                warn!("Cannot parse address '{}': {}", parts[4], e);
+                                warn!("Cannot parse dst address '{}': {}", dst_addr, e);
                                 continue;
                             }
                         };
                         // Change the port from * to 0 to parse address successfully
-                        let src_addr = parts[5].replace(":*", ":0");
-                        let src_addr = match SocketAddrV4::from_str(&src_addr) {
+                        let src_addr = parts[5].replace(":*", ":0").replace("*:0", "0.0.0.0:0");
+                        let src_addr = match SocketAddr::from_str(&src_addr) {
                             Ok(addr) => addr,
                             Err(e) => {
-                                warn!("Cannot parse address '{}': {}", &src_addr, e);
+                                warn!("Cannot parse src address '{}': {}", &src_addr, e);
                                 continue;
                             }
                         };
@@ -165,7 +169,7 @@ fn get_listening_services() -> HashSet<Service> {
                 Err(e) => warn!("Error reading pipe: {}", e)
             }
         }
-        Err(e) => warn!("Cannot run 'ss -4nlptuH': {}", e)
+        Err(e) => warn!("Cannot run 'ss -nlptuH': {}", e)
     }
 
     result
@@ -187,6 +191,6 @@ fn reduce_spaces(string: &str) -> String {
 struct Service {
     name: String,
     protocol: String,
-    src_addr: SocketAddrV4,
-    dst_addr: SocketAddrV4,
+    src_addr: SocketAddr,
+    dst_addr: SocketAddr,
 }

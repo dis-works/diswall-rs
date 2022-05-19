@@ -1,7 +1,9 @@
 [package]
 name = "diswall"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
+homepage = "https://diswall.jamm.me"
+repository = "https://github.com/dis-works/diswall-rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
