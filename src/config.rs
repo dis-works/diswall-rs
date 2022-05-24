@@ -8,6 +8,7 @@ const DEFAULT_CLIENT_NAME: &'static str = "<ENTER YOU CLIENT NAME>";
 const DEFAULT_CLIENT_PASS: &'static str = "<ENTER YOUR PASSWORD>";
 pub(crate) const PREFIX_WL: &'static str = "diswall.whitelist";
 pub(crate) const PREFIX_BL: &'static str = "diswall.blacklist";
+pub(crate) const PREFIX_STATS: &'static str = "diswall.stats";
 
 /// The main configuration structure, loaded from TOML config file
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -20,6 +21,8 @@ pub struct Config {
     pub local_only: bool,
     #[serde(default)]
     pub server_mode: bool,
+    #[serde(default = "default_send_statistics")]
+    pub send_statistics: bool,
     #[serde(default = "default_ipset_black_list")]
     pub ipset_black_list: String,
     #[serde(default = "default_ipset_white_list")]
@@ -88,6 +91,8 @@ impl Config {
             self.nats.bl_init_subject = format!("{}.{}.init.{}", PREFIX_BL, client, host);
             self.nats.bl_add_subject = format!("{}.{}.add.{}", PREFIX_BL, client, host);
             self.nats.bl_del_subject = format!("{}.{}.del.{}", PREFIX_BL, client, host);
+
+            self.nats.stats_subject = format!("{}.{}.add.{}", PREFIX_STATS, client, host);
         }
     }
 }
@@ -100,6 +105,7 @@ impl Default for Config {
             nats,
             local_only: true,
             server_mode: false,
+            send_statistics: true,
             ipset_black_list: default_ipset_black_list(),
             ipset_white_list: default_ipset_white_list(),
         }
@@ -129,6 +135,8 @@ pub struct NatsConfig {
     pub wl_del_subject: String,
     #[serde(default = "default_bl_global_subject")]
     pub bl_global_subject: String,
+    #[serde(default = "default_stats_subject")]
+    pub stats_subject: String,
     #[serde(default)]
     pub honeypots: Vec<String>
 }
@@ -148,6 +156,7 @@ impl Default for NatsConfig {
             bl_del_subject: default_bl_del_subject(),
             wl_del_subject: default_wl_del_subject(),
             bl_global_subject: default_bl_global_subject(),
+            stats_subject: default_stats_subject(),
             honeypots: Vec::new()
         }
     }
@@ -206,4 +215,12 @@ fn default_wl_del_subject() -> String {
 
 fn default_bl_global_subject() -> String {
     String::from("diswall.blacklist.new")
+}
+
+fn default_stats_subject() -> String {
+    String::from("diswall.stats.unknown.add")
+}
+
+fn default_send_statistics() -> bool {
+    true
 }

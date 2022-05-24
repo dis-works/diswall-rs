@@ -39,6 +39,7 @@ pub fn run_ipset(action: &str, list_name: &str, data: &str, comment: Option<Stri
     }
 }
 
+#[allow(dead_code)]
 pub fn ipset_list_exists(list_name: &str) -> bool {
     let command = Command::new("ipset")
         .arg("list")
@@ -59,6 +60,7 @@ pub fn ipset_list_exists(list_name: &str) -> bool {
 }
 
 /// Runs command `ipset create -exist diswall-wl hash:net comment`
+#[allow(dead_code)]
 pub fn ipset_list_create_wl(list_name: &str) -> bool {
     let command = Command::new("ipset")
         .arg("create")
@@ -80,6 +82,7 @@ pub fn ipset_list_create_wl(list_name: &str) -> bool {
 }
 
 /// Runs command `ipset create -exist diswall-bl hash:ip hashsize 32768 maxelem 1000000 timeout 86400`
+#[allow(dead_code)]
 pub fn ipset_list_create_bl(list_name: &str) -> bool {
     let command = Command::new("ipset")
         .arg("create")

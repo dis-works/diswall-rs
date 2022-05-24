@@ -1,24 +1,26 @@
 use std::convert::Infallible;
 use std::{env, io, thread};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::net::{IpAddr};
-use std::process::{Command, exit};
+use std::process::{Command, exit, Stdio};
 use std::time::Duration;
 use getopts::{Matches, Options};
 use log::{debug, error, info, LevelFilter, warn};
 use nats::Connection;
 use simplelog::{ColorChoice, CombinedLogger, ConfigBuilder, format_description, LevelPadding, TerminalMode, TermLogger, WriteLogger};
-use ipset::ipset_list_exists;
 use crate::config::Config;
-use crate::ipset::{ipset_list_create_bl, ipset_list_create_wl};
+#[cfg(not(windows))]
+use crate::ipset::{ipset_list_create_bl, ipset_list_create_wl, ipset_list_exists};
 use crate::server::run_server;
 #[cfg(not(windows))]
 use crate::install::install_client;
+use crate::timer::HourlyTimer;
 
 mod config;
 mod ipset;
 mod server;
+mod timer;
 #[cfg(not(windows))]
 mod install;
 
@@ -110,6 +112,7 @@ fn main() -> Result<(), i32> {
             }
         }
     } else {
+        debug!("Starting in local only mode...");
         if process_ips_from_parameters(&config, &opt_matches, None) {
             return Ok(());
         }
@@ -122,19 +125,33 @@ fn main() -> Result<(), i32> {
         return Ok(());
     }
 
-    if !ipset_list_exists(&config.ipset_black_list) {
-        info!("ipset list {} does not exist, creating", &config.ipset_black_list);
-        if !ipset_list_create_bl(&config.ipset_black_list) {
-            error!("Error creating ipset list {}", &config.ipset_black_list);
-            return Err(2);
+    #[cfg(not(windows))]
+    {
+        if !ipset_list_exists(&config.ipset_black_list) {
+            info!("ipset list {} does not exist, creating", &config.ipset_black_list);
+            if !ipset_list_create_bl(&config.ipset_black_list) {
+                error!("Error creating ipset list {}", &config.ipset_black_list);
+                return Err(2);
+            }
+        }
+
+        if !ipset_list_exists(&config.ipset_white_list) {
+            info!("ipset list {} does not exist, creating", &config.ipset_white_list);
+            if !ipset_list_create_wl(&config.ipset_white_list) {
+                error!("Error creating ipset list {}", &config.ipset_white_list);
+                return Err(3);
+            }
         }
     }
 
-    if !ipset_list_exists(&config.ipset_white_list) {
-        info!("ipset list {} does not exist, creating", &config.ipset_white_list);
-        if !ipset_list_create_wl(&config.ipset_white_list) {
-            error!("Error creating ipset list {}", &config.ipset_white_list);
-            return Err(3);
+    if config.send_statistics {
+        if let Some(nats) = nats.clone() {
+            let list_name = config.ipset_black_list.clone();
+            let subject = config.nats.stats_subject.clone();
+            let mut timer = HourlyTimer::new(move || {
+                collect_stats(&list_name, &subject, &nats);
+            });
+            let _ = timer.start();
         }
     }
 
@@ -436,4 +453,48 @@ pub fn kill_connection(ip: &str) -> bool {
         Err(e) => error!("Error running ss: {}", e)
     }
     false
+}
+
+/// Collects statistics about dropped packets and dropped bytes from iptables
+fn collect_stats(list_name: &str, subject: &str, nats: &Connection) {
+    let command = Command::new("iptables")
+        .arg("-nxvL")
+        .arg("INPUT")
+        .stdout(Stdio::piped())
+        .spawn();
+    match command {
+        Ok(mut child) => {
+            match child.wait() {
+                Ok(status) => {
+                    if !status.success() {
+                        warn!("Could not get stats from iptables");
+                        return;
+                    }
+                    if let Some(mut out) = child.stdout.take() {
+                        let mut buf = String::new();
+                        if let Ok(_) = out.read_to_string(&mut buf) {
+                            let lines = buf.split("\n").collect::<Vec<&str>>();
+                            for line in lines {
+                                if !line.contains(list_name) {
+                                    warn!("Could not get stats from iptables");
+                                    return;
+                                }
+                                let text = line.replace("  ", " ");
+                                let parts = text.trim().split(" ").collect::<Vec<&str>>();
+                                let packets_dropped = parts[0].parse::<u64>().unwrap_or(0u64);
+                                let bytes_dropped = parts[1].parse::<u64>().unwrap_or(0u64);
+                                info!("packets dropped: {}, bytes dropped: {}", packets_dropped, bytes_dropped);
+                                let data = format!("{{\"packets_dropped: {}\", \"bytes_dropped: {}\"}}", packets_dropped, bytes_dropped);
+                                if let Err(e) = nats.publish(subject, &data) {
+                                    warn!("Could not send stats to NATS server: {}", e);
+                                }
+                            }
+                        }
+                    }
+                },
+                Err(e) => error!("Error running iptables: {}", e)
+            }
+        }
+        Err(e) => error!("Error running iptables: {}", e)
+    }
 }

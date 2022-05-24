@@ -10,6 +10,8 @@ ipset_black_list = "diswall-bl"
 local_only = false
 # Work in server mode
 server_mode = false
+# Send statistics about dropped packets and dropped bytes to NATS server
+send_statistics = true
 
 # Configuration of NATS connection
 [nats]
