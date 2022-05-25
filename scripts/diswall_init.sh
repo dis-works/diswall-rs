@@ -19,6 +19,9 @@ iptables -A INPUT -m set --match-set diswall-wl src -j ACCEPT
 # Drop all packets for blocked IPs
 iptables -A INPUT -m set --match-set diswall-bl src -j DROP
 
+# Allow ping requests
+iptables -A INPUT -p icmp --icmp-type echo-request  -j ACCEPT
+
 #diswall_init_rules
 
 # Log all other packets:
