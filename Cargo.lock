@@ -217,6 +217,7 @@ dependencies = [
  "log",
  "nats",
  "nix",
+ "rand",
  "serde",
  "simplelog",
  "sqlite",

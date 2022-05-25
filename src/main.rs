@@ -4,11 +4,14 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::net::{IpAddr};
 use std::process::{Command, exit, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use getopts::{Matches, Options};
 use log::{debug, error, info, LevelFilter, warn};
 use nats::Connection;
 use simplelog::{ColorChoice, CombinedLogger, ConfigBuilder, format_description, LevelPadding, TerminalMode, TermLogger, WriteLogger};
+use time::OffsetDateTime;
 use crate::config::Config;
 #[cfg(not(windows))]
 use crate::ipset::{ipset_list_create_bl, ipset_list_create_wl, ipset_list_exists};
@@ -144,18 +147,20 @@ fn main() -> Result<(), i32> {
         }
     }
 
+    let banned_count = Arc::new(AtomicU32::new(0));
     if config.send_statistics {
         if let Some(nats) = nats.clone() {
+            let banned_count = banned_count.clone();
             let list_name = config.ipset_black_list.clone();
             let subject = config.nats.stats_subject.clone();
             let mut timer = HourlyTimer::new(move || {
-                collect_stats(&list_name, &subject, &nats);
+                collect_stats(&list_name, &subject, &nats, &banned_count);
             });
             let _ = timer.start();
         }
     }
 
-    if let Err(e) = lock_on_pipe(config, nats) {
+    if let Err(e) = lock_on_pipe(config, nats, &banned_count) {
         error!("Error reading pipe: {}", e);
     }
     Ok(())
@@ -291,7 +296,7 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection) {
 }
 
 /// The main function, that reads iptables log and works with IPs
-fn lock_on_pipe(config: Config, nats: Option<Connection>) -> Result<Infallible, io::Error> {
+fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<AtomicU32>) -> Result<Infallible, io::Error> {
     let f = File::open(&config.pipe_path)?;
     let mut reader = BufReader::new(f);
 
@@ -304,6 +309,7 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>) -> Result<Infallible, 
         if len > 0 {
             debug!("Got new IP: {}", line.trim());
             modify_list(true, &nats, &block_list, &config.nats.bl_add_subject, line.trim(), None);
+            let _ = banned_count.fetch_add(1u32, Ordering::SeqCst);
             line.clear();
         } else {
             thread::sleep(delay);
@@ -456,7 +462,7 @@ pub fn kill_connection(ip: &str) -> bool {
 }
 
 /// Collects statistics about dropped packets and dropped bytes from iptables
-fn collect_stats(list_name: &str, subject: &str, nats: &Connection) {
+fn collect_stats(list_name: &str, subject: &str, nats: &Connection, banned_count: &Arc<AtomicU32>) {
     let command = Command::new("iptables")
         .arg("-nxvL")
         .arg("INPUT")
@@ -483,8 +489,15 @@ fn collect_stats(list_name: &str, subject: &str, nats: &Connection) {
                                 let parts = text.trim().split(" ").collect::<Vec<&str>>();
                                 let packets_dropped = parts[0].parse::<u64>().unwrap_or(0u64);
                                 let bytes_dropped = parts[1].parse::<u64>().unwrap_or(0u64);
-                                info!("packets dropped: {}, bytes dropped: {}", packets_dropped, bytes_dropped);
-                                let data = format!("{{\"packets_dropped: {}\", \"bytes_dropped: {}\"}}", packets_dropped, bytes_dropped);
+                                let now = OffsetDateTime::now_utc().unix_timestamp();
+                                let banned = banned_count.load(Ordering::SeqCst);
+                                info!("banned: {}, packets dropped: {}, bytes dropped: {}", banned, packets_dropped, bytes_dropped);
+                                let data = format!("{{\"time: {}\", \"banned: {}\", \"packets_dropped: {}\", \"bytes_dropped: {}\"}}", now, banned, packets_dropped, bytes_dropped);
+                                // We clear banned count every hour
+                                banned_count.store(0u32, Ordering::SeqCst);
+                                // To distribute somehow requests to NATS server we make a random delay
+                                let delay = Duration::from_secs(rand::random::<u64>() % 60);
+                                thread::sleep(delay);
                                 if let Err(e) = nats.publish(subject, &data) {
                                     warn!("Could not send stats to NATS server: {}", e);
                                 }
