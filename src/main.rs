@@ -19,11 +19,13 @@ use crate::server::run_server;
 #[cfg(not(windows))]
 use crate::install::install_client;
 use crate::timer::HourlyTimer;
+use crate::types::Stats;
 
 mod config;
 mod ipset;
 mod server;
 mod timer;
+mod types;
 #[cfg(not(windows))]
 mod install;
 
@@ -489,10 +491,11 @@ fn collect_stats(list_name: &str, subject: &str, nats: &Connection, banned_count
                                 let parts = text.trim().split(" ").collect::<Vec<&str>>();
                                 let packets_dropped = parts[0].parse::<u64>().unwrap_or(0u64);
                                 let bytes_dropped = parts[1].parse::<u64>().unwrap_or(0u64);
-                                let now = OffsetDateTime::now_utc().unix_timestamp();
+                                let time = OffsetDateTime::now_utc().unix_timestamp();
                                 let banned = banned_count.load(Ordering::SeqCst);
-                                info!("banned: {}, packets dropped: {}, bytes dropped: {}", banned, packets_dropped, bytes_dropped);
-                                let data = format!("{{\"time: {}\", \"banned: {}\", \"packets_dropped: {}\", \"bytes_dropped: {}\"}}", now, banned, packets_dropped, bytes_dropped);
+                                let stats = Stats { time, banned, packets_dropped, bytes_dropped };
+                                info!("Statistics: {:?}", &stats);
+                                let data = serde_json::to_string(&stats).unwrap_or(String::from("Error serializing stats"));
                                 // We clear banned count every hour
                                 banned_count.store(0u32, Ordering::SeqCst);
                                 // To distribute somehow requests to NATS server we make a random delay

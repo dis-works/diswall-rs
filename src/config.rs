@@ -18,6 +18,8 @@ pub struct Config {
     #[serde(default)]
     pub nats: NatsConfig,
     #[serde(default)]
+    pub clickhouse: ClickHouseConfig,
+    #[serde(default)]
     pub local_only: bool,
     #[serde(default)]
     pub server_mode: bool,
@@ -100,9 +102,11 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         let nats = NatsConfig::default();
+        let clickhouse = ClickHouseConfig::default();
         Config {
             pipe_path: default_pipe(),
             nats,
+            clickhouse,
             local_only: true,
             server_mode: false,
             send_statistics: true,
@@ -160,6 +164,18 @@ impl Default for NatsConfig {
             honeypots: Vec::new()
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ClickHouseConfig {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub login: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub database: String,
 }
 
 pub fn get_hostname() -> String {

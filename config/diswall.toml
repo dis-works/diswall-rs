@@ -13,6 +13,13 @@ server_mode = false
 # Send statistics about dropped packets and dropped bytes to NATS server
 send_statistics = true
 
+# Server mode is able to catch stats from clients and throw them to ClickHouse DB
+[clickhouse]
+url = ""
+login = ""
+password = ""
+database = ""
+
 # Configuration of NATS connection
 [nats]
 server = "diswall.stream"

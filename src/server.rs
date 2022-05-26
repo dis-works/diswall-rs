@@ -5,7 +5,7 @@ use log::{debug, error, info, warn};
 use nats::Connection;
 use sqlite::State;
 use time::OffsetDateTime;
-use crate::Config;
+use crate::{Config, Stats};
 use crate::config::{PREFIX_BL, PREFIX_WL};
 
 pub const DB_NAME: &str = "diswall.db";
@@ -90,6 +90,7 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
     if let Ok(sub) = nats.subscribe(&config.nats.bl_add_subject) {
         let db = db.clone();
         let nats = nats.clone();
+        let config = config.clone();
         sub.with_handler(move |message| {
             let (client, hostname) = get_user_and_host(&message.subject);
             debug!("Got message on {} from {:?}", &message.subject, (&client, &hostname));
@@ -155,10 +156,56 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
         info!("Subscribed to {}", &config.nats.bl_del_subject);
     }
 
+    if config.send_statistics && !config.clickhouse.url.is_empty() {
+        start_stats_handler(&config, nats)
+    }
+
     let delay = Duration::from_secs(1);
     // We just loop here until kill
     loop {
         thread::sleep(delay);
+    }
+}
+
+fn start_stats_handler(config: &Config, nats: Connection) {
+    let agent = ureq::AgentBuilder::new()
+        .user_agent(&format!("DisWall v{}", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(3))
+        .max_idle_connections_per_host(10)
+        .max_idle_connections(10)
+        .build();
+
+    // Subscribe for IPs to delete from blocklist
+    if let Ok(sub) = nats.subscribe(&config.nats.stats_subject) {
+        let config = config.clone();
+        sub.with_handler(move |message| {
+            let (client, hostname) = get_user_and_host(&message.subject);
+            debug!("Got message on {} from {:?}", &message.subject, (&client, &hostname));
+            if let Ok(string) = String::from_utf8(message.data) {
+                match serde_json::from_str::<Stats>(&string) {
+                    Ok(stats) => {
+                        let request = format!("INSERT INTO stats VALUES ({}, {}, {}, {})", stats.time, stats.banned, stats.packets_dropped, stats.bytes_dropped);
+                        let response = agent
+                            .post(&config.clickhouse.url)
+                            .set("X-ClickHouse-User", &config.clickhouse.login)
+                            .set("X-ClickHouse-Key", &config.clickhouse.password)
+                            .set("X-ClickHouse-Database", &config.clickhouse.database)
+                            .send_bytes(request.as_bytes());
+                        match response {
+                            Ok(response) => {
+                                if response.status() != 200 {
+                                    warn!("Clickhouse response is {:?}", &response);
+                                }
+                            }
+                            Err(e) => warn!("Failed to send stats to clickhouse: {}", e)
+                        }
+                    }
+                    Err(e) => error!("Could not deserialize stats from {}: {}. String: {}", &client, e, &string)
+                }
+            }
+            Ok(())
+        });
+        info!("Subscribed to {}", &config.nats.stats_subject);
     }
 }
 
