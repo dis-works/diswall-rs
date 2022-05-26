@@ -25,4 +25,4 @@ iptables -A INPUT -p icmp --icmp-type echo-request  -j ACCEPT
 #diswall_init_rules
 
 # Log all other packets:
-iptables -A INPUT -j LOG --log-prefix "diswall: "
+iptables -A INPUT -j LOG --log-prefix "diswall-log: "

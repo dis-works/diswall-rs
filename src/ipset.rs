@@ -23,7 +23,7 @@ pub fn run_ipset(action: &str, list_name: &str, data: &str, comment: Option<Stri
         let command = match comment {
             Some(comment) => command.args(vec!["-exist", action, list_name, data, "comment", &comment]),
             None => command.args(vec!["-exist", action, list_name, data])
-        };
+        }.stdout(Stdio::null());
         match command.spawn() {
             Err(e) => {
                 match action {
