@@ -7,7 +7,7 @@ use nats::Connection;
 use sqlite::State;
 use time::OffsetDateTime;
 use crate::{Config, Stats};
-use crate::config::{PREFIX_BL, PREFIX_WL};
+use crate::config::{PREFIX_BL, PREFIX_STATS, PREFIX_WL};
 
 pub const DB_NAME: &str = "diswall.db";
 pub const CREATE_DB: &str = include_str!("../data/create_db.sql");
@@ -197,7 +197,7 @@ fn start_stats_handler(config: &Config, nats: Connection) {
             if let Ok(string) = String::from_utf8(message.data) {
                 match serde_json::from_str::<Stats>(&string) {
                     Ok(stats) => {
-                        let request = format!("INSERT INTO stats VALUES ({}/{}, {}, {}, {}, {})", &client, &hostname, stats.time, stats.banned, stats.packets_dropped, stats.bytes_dropped);
+                        let request = format!("INSERT INTO stats VALUES ('{}/{}', {}, {}, {}, {})", &client, &hostname, stats.time, stats.banned, stats.packets_dropped, stats.bytes_dropped);
                         let response = agent
                             .post(&config.clickhouse.url)
                             .set("X-ClickHouse-User", &config.clickhouse.login)
@@ -304,6 +304,7 @@ pub fn get_user_and_host(subject: &str) -> (String, String) {
     let mut text = subject.to_owned();
     text = text.replace(PREFIX_BL, "");
     text = text.replace(PREFIX_WL, "");
+    text = text.replace(PREFIX_STATS, "");
     if text.starts_with(".") {
         text = text[1..].to_owned();
     }
