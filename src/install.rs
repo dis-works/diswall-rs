@@ -8,6 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::fs::{File, Permissions, set_permissions};
 use log::{error, info, warn};
 use nix::unistd::mkfifo;
+use crate::utils;
 
 #[cfg(not(windows))]
 pub(crate) fn install_client() -> io::Result<()> {
@@ -116,7 +117,7 @@ fn get_listening_services() -> HashSet<Service> {
                         warn!("Result of 'ss -nlptuH' is zero!");
                         return result;
                     }
-                    let buffer = reduce_spaces(&buffer)
+                    let buffer = utils::reduce_spaces(&buffer)
                         .trim()
                         .replace("\n\n", "\n")
                         .replace(" \n", "\n")
@@ -173,18 +174,6 @@ fn get_listening_services() -> HashSet<Service> {
     }
 
     result
-}
-
-fn reduce_spaces(string: &str) -> String {
-    let mut s = string.to_owned();
-    let mut len = string.len();
-    loop {
-        s = s.replace("  ", " ");
-        if len == s.len() {
-            return s;
-        }
-        len = s.len();
-    }
 }
 
 #[derive(Debug, Eq, Hash, PartialEq)]

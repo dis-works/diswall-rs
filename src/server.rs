@@ -197,7 +197,7 @@ fn start_stats_handler(config: &Config, nats: Connection) {
             if let Ok(string) = String::from_utf8(message.data) {
                 match serde_json::from_str::<Stats>(&string) {
                     Ok(stats) => {
-                        let request = format!("INSERT INTO stats VALUES ({}, {}, {}, {})", stats.time, stats.banned, stats.packets_dropped, stats.bytes_dropped);
+                        let request = format!("INSERT INTO stats VALUES ({}/{}, {}, {}, {}, {})", &client, &hostname, stats.time, stats.banned, stats.packets_dropped, stats.bytes_dropped);
                         let response = agent
                             .post(&config.clickhouse.url)
                             .set("X-ClickHouse-User", &config.clickhouse.login)

@@ -20,6 +20,7 @@ use crate::server::run_server;
 use crate::install::install_client;
 use crate::timer::HourlyTimer;
 use crate::types::Stats;
+use crate::utils::reduce_spaces;
 use lru::LruCache;
 
 mod config;
@@ -27,6 +28,7 @@ mod ipset;
 mod server;
 mod timer;
 mod types;
+mod utils;
 #[cfg(not(windows))]
 mod install;
 
@@ -496,7 +498,7 @@ fn collect_stats(list_name: &str, subject: &str, nats: &Connection, banned_count
                                 if !line.contains(list_name) {
                                     continue;
                                 }
-                                let text = line.replace("  ", " ");
+                                let text = reduce_spaces(line);
                                 let parts = text.trim().split(" ").collect::<Vec<&str>>();
                                 let packets_dropped = parts[0].parse::<u64>().unwrap_or(0u64);
                                 let bytes_dropped = parts[1].parse::<u64>().unwrap_or(0u64);
