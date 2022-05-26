@@ -20,6 +20,7 @@ use crate::server::run_server;
 use crate::install::install_client;
 use crate::timer::HourlyTimer;
 use crate::types::Stats;
+use lru::LruCache;
 
 mod config;
 mod ipset;
@@ -306,13 +307,21 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
     let block_list = config.ipset_black_list.as_str();
     let mut line = String::new();
     let delay = Duration::from_millis(15);
+    let mut cache = LruCache::new(10);
     loop {
         let len = reader.read_line(&mut line)?;
         if len > 0 {
-            debug!("Got new IP: {}", line.trim());
-            modify_list(true, &nats, &block_list, &config.nats.bl_add_subject, line.trim(), None);
+            let ip = line.trim().to_owned();
+            if cache.contains(&ip) {
+                debug!("Already banned {}", &ip);
+                continue;
+            }
+            debug!("Got new IP: {}", &ip);
+            modify_list(true, &nats, &block_list, &config.nats.bl_add_subject, &ip, None);
+            let _ = kill_connection(&ip);
             let _ = banned_count.fetch_add(1u32, Ordering::SeqCst);
             line.clear();
+            cache.push(ip, true);
         } else {
             thread::sleep(delay);
         }
@@ -450,6 +459,7 @@ pub fn kill_connection(ip: &str) -> bool {
         .arg("-K")
         .arg("dst")
         .arg(ip)
+        .stdout(Stdio::null())
         .spawn();
     match command {
         Ok(mut child) => {
@@ -484,8 +494,7 @@ fn collect_stats(list_name: &str, subject: &str, nats: &Connection, banned_count
                             let lines = buf.split("\n").collect::<Vec<&str>>();
                             for line in lines {
                                 if !line.contains(list_name) {
-                                    warn!("Could not get stats from iptables");
-                                    return;
+                                    continue;
                                 }
                                 let text = line.replace("  ", " ");
                                 let parts = text.trim().split(" ").collect::<Vec<&str>>();
