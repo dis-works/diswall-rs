@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -74,7 +75,10 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
             debug!("Got message on {}", &message.subject);
             let (client, hostname) = get_user_and_host(&message.subject);
             if let Ok(string) = String::from_utf8(message.data) {
-                // TODO check data for valid IP
+                if !valid_ip(&string) {
+                    warn!("Could not parse IP {} from {}", &string, &client);
+                    return Ok(());
+                }
                 if let Ok(db) = db.lock() {
                     if let Err(e) = add_to_list(&db, &client, &hostname, false, &string) {
                         warn!("Error adding to DB: {}", e);
@@ -95,18 +99,21 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
             let (client, hostname) = get_user_and_host(&message.subject);
             debug!("Got message on {} from {:?}", &message.subject, (&client, &hostname));
             if let Ok(string) = String::from_utf8(message.data) {
-                // TODO check data for valid IP
+                if !valid_ip(&string) {
+                    warn!("Could not parse IP {} from {}", &string, &client);
+                    return Ok(());
+                }
                 // If this IP was sent by one of our honeypots we add this IP without client and hostname
-                let (client, hostname) = match config.nats.honeypots.contains(&client) {
-                    true => (String::new(), String::new()),
-                    false => (client, hostname)
+                let (client, hostname, honeypot) = match config.nats.honeypots.contains(&client) {
+                    true => (String::new(), String::new(), true),
+                    false => (client, hostname, false)
                 };
                 if let Ok(db) = db.lock() {
                     if let Err(e) = add_to_list(&db, &client, &hostname, true, &string) {
                         warn!("Error adding to DB: {}", e);
                     }
                 }
-                if client.is_empty() && hostname.is_empty() {
+                if honeypot {
                     match nats.publish(&config.nats.bl_global_subject, &string) {
                         Ok(_) => info!("Pushed {} to [{}]", &string, &config.nats.bl_global_subject),
                         Err(e) => warn!("Error pushing {} to [{}]: {}", &string, &config.nats.bl_global_subject, e)
@@ -125,7 +132,10 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
             let (client, hostname) = get_user_and_host(&message.subject);
             debug!("Got message on {} from {:?}", &message.subject, (&client, &hostname));
             if let Ok(string) = String::from_utf8(message.data) {
-                // TODO check data for valid IP
+                if !valid_ip(&string) {
+                    warn!("Could not parse IP {} from {}", &string, &client);
+                    return Ok(());
+                }
                 if let Ok(db) = db.lock() {
                     if let Err(e) = delete_from_list(&db, &client, &hostname, false, &string) {
                         warn!("Error removing from DB: {}", e);
@@ -144,7 +154,10 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
             let (client, hostname) = get_user_and_host(&message.subject);
             debug!("Got message on {} from {:?}", &message.subject, (&client, &hostname));
             if let Ok(string) = String::from_utf8(message.data) {
-                // TODO check data for valid IP
+                if !valid_ip(&string) {
+                    warn!("Could not parse IP {} from {}", &string, &client);
+                    return Ok(());
+                }
                 if let Ok(db) = db.lock() {
                     if let Err(e) = delete_from_list(&db, &client, &hostname, true, &string) {
                         warn!("Error removing from DB: {}", e);
@@ -302,5 +315,12 @@ pub fn get_user_and_host(subject: &str) -> (String, String) {
     match split.len() {
         2 => (split[0].to_owned(), split[1].to_owned()),
         _ => (split[0].to_owned(), String::new())
+    }
+}
+
+pub fn valid_ip(ip: &str) -> bool {
+    match ip.parse::<IpAddr>() {
+        Ok(_) => true,
+        Err(_) => false,
     }
 }
