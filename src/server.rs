@@ -116,6 +116,7 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
                     return Ok(());
                 }
                 let time = OffsetDateTime::now_utc().unix_timestamp();
+                let client_mix = mix_client(format!("{}/{}/{}", &client, &hostname, &config.clickhouse.salt).as_bytes());
                 // If this IP was sent by one of our honeypots we add this IP without client and hostname
                 let (client, hostname, honeypot) = match config.nats.honeypots.contains(&client) {
                     true => (String::new(), String::new(), true),
@@ -132,8 +133,7 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
                         Err(e) => warn!("Error pushing {} to [{}]: {}", &ip, &config.nats.bl_global_subject, e)
                     }
                 }
-                let client = mix_client(format!("{}/{}/{}", &client, &hostname, &config.clickhouse.salt).as_bytes());
-                let request = format!("INSERT INTO scanners VALUES ({}, {}, '{}')", &client, time, &ip);
+                let request = format!("INSERT INTO scanners VALUES ({}, {}, '{}')", &client_mix, time, &ip);
                 send_clickhouse_request(&agent, &config, &request);
             }
             Ok(())
