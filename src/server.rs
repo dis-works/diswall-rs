@@ -1,3 +1,4 @@
+use std::hash::Hasher;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -6,6 +7,7 @@ use log::{debug, error, info, trace, warn};
 use nats::Connection;
 use sqlite::State;
 use time::OffsetDateTime;
+use ureq::Agent;
 use crate::{Config, Stats};
 use crate::config::{PREFIX_BL, PREFIX_STATS, PREFIX_WL};
 
@@ -91,39 +93,52 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
         info!("Subscribed to {}", &config.nats.wl_add_subject);
     }
 
+    let agent = ureq::AgentBuilder::new()
+        .user_agent(&format!("DisWall v{}", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(3))
+        .max_idle_connections_per_host(4)
+        .max_idle_connections(16)
+        .build();
+
     // Subscribe for new IPs for blocklist
     if let Ok(sub) = nats.subscribe(&config.nats.bl_add_subject) {
         let db = db.clone();
         let nats = nats.clone();
         let config = config.clone();
+        let agent = agent.clone();
+        let subject = config.nats.bl_add_subject.clone();
         sub.with_handler(move |message| {
             let (client, hostname) = get_user_and_host(&message.subject);
             debug!("Got message on {} from {:?}", &message.subject, (&client, &hostname));
-            if let Ok(string) = String::from_utf8(message.data) {
-                if !valid_ip(&string) {
-                    warn!("Could not parse IP {} from {}", &string, &client);
+            if let Ok(ip) = String::from_utf8(message.data) {
+                if !valid_ip(&ip) {
+                    warn!("Could not parse IP {} from {}", &ip, &client);
                     return Ok(());
                 }
+                let time = OffsetDateTime::now_utc().unix_timestamp();
                 // If this IP was sent by one of our honeypots we add this IP without client and hostname
                 let (client, hostname, honeypot) = match config.nats.honeypots.contains(&client) {
                     true => (String::new(), String::new(), true),
                     false => (client, hostname, false)
                 };
                 if let Ok(db) = db.lock() {
-                    if let Err(e) = add_to_list(&db, &client, &hostname, true, &string) {
+                    if let Err(e) = add_to_list(&db, &client, &hostname, true, &ip) {
                         warn!("Error adding to DB: {}", e);
                     }
                 }
                 if honeypot {
-                    match nats.publish(&config.nats.bl_global_subject, &string) {
-                        Ok(_) => info!("Pushed {} to [{}]", &string, &config.nats.bl_global_subject),
-                        Err(e) => warn!("Error pushing {} to [{}]: {}", &string, &config.nats.bl_global_subject, e)
+                    match nats.publish(&config.nats.bl_global_subject, &ip) {
+                        Ok(_) => info!("Pushed {} to [{}]", &ip, &config.nats.bl_global_subject),
+                        Err(e) => warn!("Error pushing {} to [{}]: {}", &ip, &config.nats.bl_global_subject, e)
                     }
                 }
+                let client = mix_client(format!("{}/{}/{}", &client, &hostname, &config.clickhouse.salt).as_bytes());
+                let request = format!("INSERT INTO scanners VALUES ({}, {}, '{}')", &client, time, &ip);
+                send_clickhouse_request(&agent, &config, &request);
             }
             Ok(())
         });
-        info!("Subscribed to {}", &config.nats.bl_add_subject);
+        info!("Subscribed to {}", &subject);
     }
 
     // Subscribe for IPs to delete from whitelist
@@ -171,7 +186,7 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
     }
 
     if config.send_statistics && !config.clickhouse.url.is_empty() {
-        start_stats_handler(&config, nats)
+        start_stats_handler(&config, nats, agent);
     }
 
     let delay = Duration::from_secs(1);
@@ -181,17 +196,11 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
     }
 }
 
-fn start_stats_handler(config: &Config, nats: Connection) {
-    let agent = ureq::AgentBuilder::new()
-        .user_agent(&format!("DisWall v{}", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(3))
-        .max_idle_connections_per_host(10)
-        .max_idle_connections(10)
-        .build();
-
+fn start_stats_handler(config: &Config, nats: Connection, agent: Agent) {
     // Subscribe for IPs to delete from blocklist
     if let Ok(sub) = nats.subscribe(&config.nats.stats_subject) {
         let config = config.clone();
+        let subject = config.nats.stats_subject.clone();
         sub.with_handler(move |message| {
             let (client, hostname) = get_user_and_host(&message.subject);
             debug!("Got message on {} from {:?}", &message.subject, (&client, &hostname));
@@ -199,27 +208,31 @@ fn start_stats_handler(config: &Config, nats: Connection) {
                 match serde_json::from_str::<Stats>(&string) {
                     Ok(stats) => {
                         let request = format!("INSERT INTO stats VALUES ('{}/{}', {}, {}, {}, {})", &client, &hostname, stats.time, stats.banned, stats.packets_dropped, stats.bytes_dropped);
-                        let response = agent
-                            .post(&config.clickhouse.url)
-                            .set("X-ClickHouse-User", &config.clickhouse.login)
-                            .set("X-ClickHouse-Key", &config.clickhouse.password)
-                            .set("X-ClickHouse-Database", &config.clickhouse.database)
-                            .send_bytes(request.as_bytes());
-                        match response {
-                            Ok(response) => {
-                                if response.status() != 200 {
-                                    warn!("Clickhouse response is {:?}", &response);
-                                }
-                            }
-                            Err(e) => warn!("Failed to send stats to clickhouse: {}", e)
-                        }
+                        send_clickhouse_request(&agent, &config, &request);
                     }
                     Err(e) => error!("Could not deserialize stats from {}: {}. String: {}", &client, e, &string)
                 }
             }
             Ok(())
         });
-        info!("Subscribed to {}", &config.nats.stats_subject);
+        info!("Subscribed to {}", &subject);
+    }
+}
+
+fn send_clickhouse_request(agent: &Agent, config: &Config, request: &str) {
+    let response = agent
+        .post(&config.clickhouse.url)
+        .set("X-ClickHouse-User", &config.clickhouse.login)
+        .set("X-ClickHouse-Key", &config.clickhouse.password)
+        .set("X-ClickHouse-Database", &config.clickhouse.database)
+        .send_bytes(request.as_bytes());
+    match response {
+        Ok(response) => {
+            if response.status() != 200 {
+                warn!("Clickhouse response is {:?}", &response);
+            }
+        }
+        Err(e) => warn!("Failed to send stats to clickhouse: {}", e)
     }
 }
 
@@ -338,4 +351,20 @@ pub fn valid_ip(ip: &str) -> bool {
         Ok(_) => true,
         Err(_) => false,
     }
+}
+
+pub fn mix_client(data: &[u8]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hash;
+
+    let mut hasher = DefaultHasher::new();
+    data.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[test]
+pub fn test_mix() {
+    let data = b"Some string";
+    let mix = mix_client(data);
+    assert_eq!(mix, 12313646071179450357);
 }

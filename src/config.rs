@@ -176,6 +176,8 @@ pub struct ClickHouseConfig {
     pub password: String,
     #[serde(default)]
     pub database: String,
+    #[serde(default)]
+    pub salt: String,
 }
 
 pub fn get_hostname() -> String {
