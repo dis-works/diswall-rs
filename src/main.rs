@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use getopts::{Matches, Options};
-use log::{debug, error, info, LevelFilter, warn};
+use log::{debug, error, info, LevelFilter, trace, warn};
 use nats::Connection;
 use simplelog::{ColorChoice, CombinedLogger, ConfigBuilder, format_description, LevelPadding, TerminalMode, TermLogger, WriteLogger};
 use time::OffsetDateTime;
@@ -209,7 +209,7 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection) {
             buf.push('\n');
             buf.push_str(&format!("add {} {}", &config.ipset_white_list, line));
             // TODO remove print in production
-            debug!("To whitelist: {}", line);
+            trace!("To whitelist: {}", line);
         }
         ipset::run_ipset("restore", "", &buf, None);
     }
@@ -222,7 +222,7 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection) {
             buf.push('\n');
             buf.push_str(&format!("add {} {}", &config.ipset_black_list, line));
             // TODO remove print in production
-            debug!("To blacklist: {}", line);
+            trace!("To blacklist: {}", line);
         }
         ipset::run_ipset("restore", "", &buf, None);
     }
@@ -308,8 +308,8 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
     debug!("Pipe opened, waiting for IPs");
     let block_list = config.ipset_black_list.as_str();
     let mut line = String::new();
-    let delay = Duration::from_millis(15);
-    let mut cache = LruCache::new(10);
+    let delay = Duration::from_millis(5);
+    let mut cache = LruCache::new(5);
     loop {
         let len = reader.read_line(&mut line)?;
         if len > 0 {
@@ -414,6 +414,7 @@ fn setup_logger(opt_matches: &Matches) {
     }
     let config = ConfigBuilder::new()
         .add_filter_ignore_str("rustls::")
+        .add_filter_ignore_str("ureq::")
         .set_thread_level(LevelFilter::Error)
         .set_location_level(LevelFilter::Off)
         .set_target_level(LevelFilter::Error)

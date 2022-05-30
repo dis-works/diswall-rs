@@ -2,7 +2,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use nats::Connection;
 use sqlite::State;
 use time::OffsetDateTime;
@@ -14,6 +14,7 @@ pub const CREATE_DB: &str = include_str!("../data/create_db.sql");
 pub const CHECK_DB: &str = "SELECT name FROM sqlite_master WHERE type='table' AND name='data';";
 pub const GET_LIST: &str = "SELECT ip FROM data WHERE client=? AND hostname=? AND blacklist=? AND until>?;";
 pub const ADD_TO_LIST: &str = "INSERT INTO data (client, hostname, blacklist, ip, until) VALUES (?, ?, ?, ?, ?);";
+pub const UPDATE_IN_LIST: &str = "UPDATE data SET until=? WHERE client=? AND hostname=? AND blacklist=? AND ip=?;";
 pub const GET_UNTIL: &str = "SELECT until FROM data WHERE client=? AND hostname=? AND blacklist=? AND ip=?";
 pub const DELETE_FROM_LIST: &str = "DELETE FROM data WHERE client=? AND hostname=? AND blacklist=? AND ip=?;";
 
@@ -259,8 +260,21 @@ fn add_to_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist:
     statement.bind(3, blacklist as i64)?;
     statement.bind(4, ip)?;
     match statement.next().unwrap() {
-        State::Row => Ok(State::Done),
+        State::Row => {
+            trace!("Updating until time for {}", &ip);
+            if let Ok(_) = statement.read::<i64>(0) {
+                let mut statement = db.prepare(UPDATE_IN_LIST)?;
+                statement.bind(1, until)?;
+                statement.bind(2, client)?;
+                statement.bind(3, hostname)?;
+                statement.bind(4, blacklist as i64)?;
+                statement.bind(5, ip)?;
+                return statement.next();
+            }
+            Ok(State::Done)
+        },
         State::Done => {
+            trace!("Adding {} to list", &ip);
             // If we have no record of this IP we add it now
             let mut statement = db.prepare(ADD_TO_LIST)?;
             statement.bind(1, client)?;
