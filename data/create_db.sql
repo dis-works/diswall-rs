@@ -7,3 +7,4 @@ CREATE TABLE data (
 );
 
 CREATE INDEX client_host ON data (client, hostname);
+CREATE INDEX client_bl_ip ON data (client, blacklist, ip);

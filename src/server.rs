@@ -14,10 +14,11 @@ use crate::config::{PREFIX_BL, PREFIX_STATS, PREFIX_WL};
 pub const DB_NAME: &str = "diswall.db";
 pub const CREATE_DB: &str = include_str!("../data/create_db.sql");
 pub const CHECK_DB: &str = "SELECT name FROM sqlite_master WHERE type='table' AND name='data';";
+pub const TUNE_DB: &str = "pragma temp_store = memory;\npragma mmap_size = 1073741824;";
 pub const GET_LIST: &str = "SELECT ip FROM data WHERE client=? AND hostname=? AND blacklist=? AND until>?;";
 pub const ADD_TO_LIST: &str = "INSERT INTO data (client, hostname, blacklist, ip, until) VALUES (?, ?, ?, ?, ?);";
-pub const UPDATE_IN_LIST: &str = "UPDATE data SET until=? WHERE client=? AND hostname=? AND blacklist=? AND ip=?;";
-pub const GET_UNTIL: &str = "SELECT until FROM data WHERE client=? AND hostname=? AND blacklist=? AND ip=?";
+pub const UPDATE_IN_LIST: &str = "UPDATE data SET until=? WHERE client=? AND blacklist=? AND ip=?;";
+pub const GET_COUNT: &str = "SELECT COUNT(ip) FROM data WHERE client=? AND blacklist=? AND ip=?;";
 pub const DELETE_FROM_LIST: &str = "DELETE FROM data WHERE client=? AND hostname=? AND blacklist=? AND ip=?;";
 
 pub fn run_server(config: Config, nats: Option<Connection>) {
@@ -267,36 +268,35 @@ fn get_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: bo
 
 fn add_to_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: bool, ip: &str) -> sqlite::Result<State> {
     let until = OffsetDateTime::now_utc().unix_timestamp() + 86400;
-    let mut statement = db.prepare(GET_UNTIL)?;
+    let mut statement = db.prepare(GET_COUNT)?;
     statement.bind(1, client)?;
-    statement.bind(2, hostname)?;
-    statement.bind(3, blacklist as i64)?;
-    statement.bind(4, ip)?;
-    match statement.next().unwrap() {
-        State::Row => {
-            trace!("Updating until time for {}", &ip);
-            if let Ok(_) = statement.read::<i64>(0) {
-                let mut statement = db.prepare(UPDATE_IN_LIST)?;
-                statement.bind(1, until)?;
-                statement.bind(2, client)?;
-                statement.bind(3, hostname)?;
-                statement.bind(4, blacklist as i64)?;
-                statement.bind(5, ip)?;
-                return statement.next();
-            }
-            Ok(State::Done)
+    statement.bind(2, blacklist as i64)?;
+    statement.bind(3, ip)?;
+    let count = match statement.next().unwrap() {
+        State::Row => match statement.read::<i64>(0) {
+            Ok(count) => count,
+            Err(..) => 0
         },
-        State::Done => {
-            trace!("Adding {} to list", &ip);
-            // If we have no record of this IP we add it now
-            let mut statement = db.prepare(ADD_TO_LIST)?;
-            statement.bind(1, client)?;
-            statement.bind(2, hostname)?;
-            statement.bind(3, blacklist as i64)?;
-            statement.bind(4, ip)?;
-            statement.bind(5, until)?;
-            statement.next()
-        }
+        State::Done => 0
+    };
+    if count > 0 {
+        trace!("Updating {} ban time", &ip);
+        let mut statement = db.prepare(UPDATE_IN_LIST)?;
+        statement.bind(1, until)?;
+        statement.bind(2, client)?;
+        statement.bind(3, blacklist as i64)?;
+        statement.bind(4, ip)?;
+        statement.next()
+    } else {
+        // If we have no record of this IP we add it now
+        trace!("Adding {} to list", &ip);
+        let mut statement = db.prepare(ADD_TO_LIST)?;
+        statement.bind(1, client)?;
+        statement.bind(2, hostname)?;
+        statement.bind(3, blacklist as i64)?;
+        statement.bind(4, ip)?;
+        statement.bind(5, until)?;
+        statement.next()
     }
 }
 
@@ -323,6 +323,9 @@ fn create_db_if_needed(db: &sqlite::Connection) {
         if let Err(e) = db.execute(CREATE_DB) {
             error!("Error creating main data table: {}", e);
         }
+    }
+    if let Err(e) = db.execute(TUNE_DB) {
+        warn!("Error tuning DB: {}", e);
     }
 }
 
