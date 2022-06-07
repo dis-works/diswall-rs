@@ -316,17 +316,18 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
             let ip = line.trim().to_owned();
             if cache.contains(&ip) {
                 debug!("Already banned {}", &ip);
+                line.clear();
                 continue;
             }
             debug!("Got new IP: {}", &ip);
             modify_list(true, &nats, &block_list, &config.nats.bl_add_subject, &ip, None);
             let _ = kill_connection(&ip);
             let _ = banned_count.fetch_add(1u32, Ordering::SeqCst);
-            line.clear();
             cache.push(ip, true);
         } else {
             thread::sleep(delay);
         }
+        line.clear();
     }
 }
 
