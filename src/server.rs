@@ -2,7 +2,7 @@ use std::hash::Hasher;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use log::{debug, error, info, trace, warn};
 use nats::Connection;
 use sqlite::State;
@@ -17,6 +17,7 @@ pub const CHECK_DB: &str = "SELECT name FROM sqlite_master WHERE type='table' AN
 pub const TUNE_DB: &str = "pragma temp_store = memory;\npragma mmap_size = 1073741824;";
 pub const GET_LIST: &str = "SELECT ip FROM data WHERE client=? AND hostname=? AND blacklist=? AND until>?;";
 pub const ADD_TO_LIST: &str = "INSERT INTO data (client, hostname, blacklist, ip, until) VALUES (?, ?, ?, ?, ?);";
+pub const COUNT_LIST: &str = "SELECT COUNT(ip) FROM data WHERE client=? AND hostname=? AND blacklist=? AND until>?;";
 pub const UPDATE_IN_LIST: &str = "UPDATE data SET until=? WHERE client=? AND blacklist=? AND ip=?;";
 pub const GET_COUNT: &str = "SELECT COUNT(ip) FROM data WHERE client=? AND blacklist=? AND ip=?;";
 pub const DELETE_FROM_LIST: &str = "DELETE FROM data WHERE client=? AND hostname=? AND blacklist=? AND ip=?;";
@@ -191,9 +192,17 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
     }
 
     let delay = Duration::from_secs(1);
+    let mut timer = Instant::now();
     // We just loop here until kill
     loop {
         thread::sleep(delay);
+        if timer.elapsed().as_secs() >= 300 {
+            if let Ok(db) = db.lock() {
+                let count = count_list(&db, "", "", true);
+                info!("Currently blocked IP count: {}", count);
+            }
+            timer = Instant::now();
+        }
     }
 }
 
@@ -307,6 +316,31 @@ fn delete_from_list(db: &sqlite::Connection, client: &str, hostname: &str, black
     statement.bind(3, blacklist as i64)?;
     statement.bind(4, ip)?;
     statement.next()
+}
+
+fn count_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: bool) -> i64 {
+    let until = OffsetDateTime::now_utc().unix_timestamp();
+    let blacklist = match blacklist {
+        true => 1,
+        false => 0
+    };
+    match db.prepare(COUNT_LIST) {
+        Ok(mut statement) => {
+            statement.bind(1, client).expect("Error in bind");
+            statement.bind(2, hostname).expect("Error in bind");
+            statement.bind(3, blacklist).expect("Error in bind");
+            statement.bind(4, until).expect("Error in bind");
+            while statement.next().unwrap() == State::Row {
+                if let Ok(count) = statement.read::<i64>(0) {
+                    return count;
+                }
+            }
+        }
+        Err(e) => {
+            info!("No list found. {}", e);
+        }
+    }
+    0i64
 }
 
 fn create_db_if_needed(db: &sqlite::Connection) {
