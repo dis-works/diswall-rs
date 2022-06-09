@@ -217,7 +217,10 @@ fn start_stats_handler(config: &Config, nats: Connection, agent: Agent) {
             if let Ok(string) = String::from_utf8(message.data) {
                 match serde_json::from_str::<Stats>(&string) {
                     Ok(stats) => {
-                        let request = format!("INSERT INTO stats VALUES ('{}/{}', {}, {}, {}, {})", &client, &hostname, stats.time, stats.banned, stats.packets_dropped, stats.bytes_dropped);
+                        let request = format!("INSERT INTO stats VALUES ('{}/{}', {}, {}, {}, {}, {}, {})",
+                                              &client, &hostname, stats.time, stats.banned,
+                                              stats.packets_dropped, stats.bytes_dropped,
+                                              stats.packets_accepted, stats.bytes_accepted);
                         send_clickhouse_request(&agent, &config, &request);
                     }
                     Err(e) => error!("Could not deserialize stats from {}: {}. String: {}", &client, e, &string)
