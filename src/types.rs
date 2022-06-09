@@ -7,4 +7,6 @@ pub struct Stats {
     pub(crate) banned: u32,
     pub(crate) packets_dropped: u64,
     pub(crate) bytes_dropped: u64,
+    pub(crate) packets_accepted: u64,
+    pub(crate) bytes_accepted: u64,
 }

@@ -496,27 +496,34 @@ fn collect_stats(list_name: &str, subject: &str, nats: &Connection, banned_count
                         let mut buf = String::new();
                         if let Ok(_) = out.read_to_string(&mut buf) {
                             let lines = buf.split("\n").collect::<Vec<&str>>();
+                            let time = OffsetDateTime::now_utc().unix_timestamp();
+                            let banned = banned_count.load(Ordering::SeqCst);
+                            // We clear banned count every hour
+                            banned_count.store(0u32, Ordering::SeqCst);
+                            let mut stats = Stats { time, banned, packets_dropped: 0, bytes_dropped: 0, packets_accepted: 0, bytes_accepted: 0 };
                             for line in lines {
-                                if !line.contains(list_name) {
-                                    continue;
-                                }
                                 let text = reduce_spaces(line);
                                 let parts = text.trim().split(" ").collect::<Vec<&str>>();
-                                let packets_dropped = parts[0].parse::<u64>().unwrap_or(0u64);
-                                let bytes_dropped = parts[1].parse::<u64>().unwrap_or(0u64);
-                                let time = OffsetDateTime::now_utc().unix_timestamp();
-                                let banned = banned_count.load(Ordering::SeqCst);
-                                let stats = Stats { time, banned, packets_dropped, bytes_dropped };
-                                info!("Statistics: {:?}", &stats);
-                                let data = serde_json::to_string(&stats).unwrap_or(String::from("Error serializing stats"));
-                                // We clear banned count every hour
-                                banned_count.store(0u32, Ordering::SeqCst);
-                                // To distribute somehow requests to NATS server we make a random delay
-                                let delay = Duration::from_secs(rand::random::<u64>() % 60);
-                                thread::sleep(delay);
-                                if let Err(e) = nats.publish(subject, &data) {
-                                    warn!("Could not send stats to NATS server: {}", e);
+                                // We don't count local traffic
+                                if parts[5].eq("lo") {
+                                    continue;
                                 }
+
+                                if parts[2].eq("ACCEPT") {
+                                    stats.packets_accepted += parts[0].parse::<u64>().unwrap_or(0u64);
+                                    stats.bytes_accepted += parts[1].parse::<u64>().unwrap_or(0u64);
+                                } else if line.contains(list_name) {
+                                    stats.packets_dropped = parts[0].parse::<u64>().unwrap_or(0u64);
+                                    stats.bytes_dropped = parts[1].parse::<u64>().unwrap_or(0u64);
+                                }
+                            }
+                            info!("Statistics: {:?}", &stats);
+                            let data = serde_json::to_string(&stats).unwrap_or(String::from("Error serializing stats"));
+                            // To distribute somehow requests to NATS server we make a random delay
+                            let delay = Duration::from_secs(rand::random::<u64>() % 60);
+                            thread::sleep(delay);
+                            if let Err(e) = nats.publish(subject, &data) {
+                                warn!("Could not send stats to NATS server: {}", e);
                             }
                         }
                     }
