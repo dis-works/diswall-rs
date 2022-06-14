@@ -505,7 +505,7 @@ fn collect_stats(list_name: &str, subject: &str, nats: &Connection, banned_count
                                 let text = reduce_spaces(line);
                                 let parts = text.trim().split(" ").collect::<Vec<&str>>();
                                 // We don't count local traffic
-                                if parts[5].eq("lo") {
+                                if parts.len() < 5 || parts[5].eq("lo") {
                                     continue;
                                 }
 
