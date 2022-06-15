@@ -17,7 +17,7 @@ use crate::config::Config;
 use crate::ipset::{ipset_list_create_bl, ipset_list_create_wl, ipset_list_exists};
 use crate::server::run_server;
 #[cfg(not(windows))]
-use crate::install::install_client;
+use crate::install::{install_client, update_client};
 use crate::timer::HourlyTimer;
 use crate::types::Stats;
 use crate::utils::reduce_spaces;
@@ -88,6 +88,23 @@ fn main() -> Result<(), i32> {
             if let Err(e) = install_client() {
                 error!("Error installing DisWall: {}", &e);
                 return Err(100);
+            }
+            return Ok(());
+        }
+    }
+
+    if opt_matches.opt_present("update") {
+        #[cfg(windows)]
+        {
+            error!("Installing DisWall on Windows is not supported!");
+            return Err(110);
+        }
+        #[cfg(not(windows))]
+        {
+            info!("Updating DisWall v{}", env!("CARGO_PKG_VERSION"));
+            if let Err(e) = update_client() {
+                error!("Error installing DisWall: {}", &e);
+                return Err(101);
             }
             return Ok(());
         }
@@ -208,7 +225,6 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection) {
         for line in string.lines() {
             buf.push('\n');
             buf.push_str(&format!("add {} {}", &config.ipset_white_list, line));
-            // TODO remove print in production
             trace!("To whitelist: {}", line);
         }
         ipset::run_ipset("restore", "", &buf, None);
@@ -221,7 +237,6 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection) {
         for line in string.lines() {
             buf.push('\n');
             buf.push_str(&format!("add {} {}", &config.ipset_black_list, line));
-            // TODO remove print in production
             trace!("To blacklist: {}", line);
         }
         ipset::run_ipset("restore", "", &buf, None);
@@ -372,6 +387,7 @@ fn get_options(args: &Vec<String>) -> (Options, Matches) {
     opts.optflag("h", "help", "Print this help menu");
     opts.optflag("v", "version", "Print version and exit");
     opts.optflag("", "install", "Install DisWall as system service (in client mode)");
+    opts.optflag("", "update", "Update DisWall to latest release from GitHub");
     opts.optflag("d", "debug", "Show trace messages, more than debug");
     opts.optflag("g", "generate", "Generate fresh configuration file. It is better to redirect contents to file.");
     opts.optopt("c", "config", "Set configuration file path", "FILE");
@@ -397,8 +413,6 @@ fn get_options(args: &Vec<String>) -> (Options, Matches) {
 
     opts.optflag("k", "kill", "Kill already established connection using `ss -K`");
     opts.optflag("", "server", "Start diswall NATS server to handle init messages.");
-    // TODO
-    //opts.optopt("", "creds", "Use credentials file", "FILE");
 
     let opt_matches = match opts.parse(&args[1..]) {
         Ok(m) => m,
