@@ -54,10 +54,16 @@ But the most important subject is `diswall.blacklist.new` - the server, that is 
 
 # Installation
 
-The simplest way to install diswall on your server is to use autoinstall functionality in diswall itself.
-1. Download binary for your architecture: `wget -O diswall https://github.com/dis-works/diswall-rs/releases/download/v0.1.0/diswall-v0.1.0-x86_64`
-2. Make it executable: `chmod +x diswall`
-3. Run installation: `./diswall --install`
+The simplest way to install diswall on your server is to use autoinstall functionality in diswall itself:
+```bash
+curl https://get.diswall.stream | bash
+```
+or
+```bash
+wget -O - https://get.diswall.stream | bash
+```
+It will download a short script that will determine your architecture and get the latest appropriate release binary from GitHub.
+Then it will start installation procedure from this binary.
 
 This will copy the binary to `/usr/bin`, create systemd service, diswall config (`/etc/diswall/diswall.conf`)
 and iptables initialization script `/usr/bin/diswall_init.sh`.
