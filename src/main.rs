@@ -221,10 +221,9 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection) {
     let msg = String::new();
     if let Ok(message) = nats.request(&config.nats.wl_init_subject, &msg) {
         let string = String::from_utf8(message.data).unwrap_or(String::default());
-        let mut buf = format!("create -exist {} hash:net comment", &config.ipset_white_list);
+        let mut buf = String::new();
         for line in string.lines() {
-            buf.push('\n');
-            buf.push_str(&format!("add {} {}", &config.ipset_white_list, line));
+            buf.push_str(&format!("add {} {}\n", &config.ipset_white_list, line));
             trace!("To whitelist: {}", line);
         }
         ipset::run_ipset("restore", "", &buf, None);
@@ -233,10 +232,9 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection) {
     // Getting blocklist from server
     if let Ok(message) = nats.request(&config.nats.bl_init_subject, &msg) {
         let string = String::from_utf8(message.data).unwrap_or(String::default());
-        let mut buf = format!("create -exist {} hash:ip hashsize 32768 maxelem 1000000 timeout 86400", &config.ipset_black_list);
+        let mut buf = String::new();
         for line in string.lines() {
-            buf.push('\n');
-            buf.push_str(&format!("add {} {}", &config.ipset_black_list, line));
+            buf.push_str(&format!("add {} {}\n", &config.ipset_black_list, line));
             trace!("To blacklist: {}", line);
         }
         ipset::run_ipset("restore", "", &buf, None);
