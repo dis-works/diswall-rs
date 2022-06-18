@@ -20,11 +20,18 @@ pub fn run_ipset(action: &str, list_name: &str, data: &str, comment: Option<Stri
         }
     } else {
         let mut command = Command::new("ipset");
-        let command = match comment {
-            Some(comment) => command.args(vec!["-exist", action, list_name, data, "comment", &comment]),
-            None => command.args(vec!["-exist", action, list_name, data])
-        }.stdout(Stdio::null());
-        match command.spawn() {
+        let mut args = vec!["-exist", action, list_name];
+        if data.contains(" ") {
+            let mut parts = data.split(" ").collect::<Vec<_>>();
+            args.append(&mut parts);
+        } else {
+            args.push(&data);
+        }
+        if let Some(comment) = comment {
+            args.push("comment");
+            args.push(&comment);
+        }
+        match command.stdout(Stdio::null()).spawn() {
             Err(e) => {
                 match action {
                     "add" => error!("Error adding {} to ipset: {}", data, e),

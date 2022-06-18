@@ -466,6 +466,12 @@ fn setup_logger(opt_matches: &Matches) {
 }
 
 pub fn kill_connection(ip: &str) -> bool {
+    let ip = if ip.contains(" ") {
+        let parts = ip.split(" ").collect::<Vec<_>>();
+        parts[0]
+    } else {
+        ip
+    };
     if ip.parse::<IpAddr>().is_err() {
         error!("Can not parse IP address from {}", ip);
         return false;

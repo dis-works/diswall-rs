@@ -1,4 +1,6 @@
+use std::fs::File;
 use std::hash::Hasher;
+use std::io::{BufRead, BufReader};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -15,12 +17,13 @@ pub const DB_NAME: &str = "diswall.db";
 pub const CREATE_DB: &str = include_str!("../data/create_db.sql");
 pub const CHECK_DB: &str = "SELECT name FROM sqlite_master WHERE type='table' AND name='data';";
 pub const TUNE_DB: &str = "pragma temp_store = memory;\npragma mmap_size = 1073741824;";
-pub const GET_LIST: &str = "SELECT ip FROM data WHERE client=? AND hostname=? AND blacklist=? AND until>?;";
+pub const GET_LIST: &str = "SELECT ip, until FROM data WHERE client=? AND hostname=? AND blacklist=? AND until>?;";
 pub const ADD_TO_LIST: &str = "INSERT INTO data (client, hostname, blacklist, ip, until) VALUES (?, ?, ?, ?, ?);";
 pub const COUNT_LIST: &str = "SELECT COUNT(ip) FROM data WHERE client=? AND hostname=? AND blacklist=? AND until>?;";
 pub const UPDATE_IN_LIST: &str = "UPDATE data SET until=? WHERE client=? AND blacklist=? AND ip=?;";
 pub const GET_COUNT: &str = "SELECT COUNT(ip) FROM data WHERE client=? AND blacklist=? AND ip=?;";
 pub const DELETE_FROM_LIST: &str = "DELETE FROM data WHERE client=? AND hostname=? AND blacklist=? AND ip=?;";
+const DEFAULT_TIMEOUT: i64 = 86400;
 
 pub fn run_server(config: Config, nats: Option<Connection>) {
     if nats.is_none() {
@@ -85,7 +88,7 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
                     return Ok(());
                 }
                 if let Ok(db) = db.lock() {
-                    if let Err(e) = add_to_list(&db, &client, &hostname, false, &string) {
+                    if let Err(e) = add_to_list(&db, &client, &hostname, false, &string, DEFAULT_TIMEOUT) {
                         warn!("Error adding to DB: {}", e);
                     }
                 }
@@ -125,7 +128,7 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
                     false => (client, hostname, false)
                 };
                 if let Ok(db) = db.lock() {
-                    if let Err(e) = add_to_list(&db, &client, &hostname, true, &ip) {
+                    if let Err(e) = add_to_list(&db, &client, &hostname, true, &ip, DEFAULT_TIMEOUT) {
                         warn!("Error adding to DB: {}", e);
                     }
                 }
@@ -188,20 +191,66 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
     }
 
     if config.send_statistics && !config.clickhouse.url.is_empty() {
-        start_stats_handler(&config, nats, agent);
+        start_stats_handler(&config, nats.clone(), agent);
     }
 
-    let delay = Duration::from_secs(1);
-    let mut timer = Instant::now();
-    // We just loop here until kill
-    loop {
-        thread::sleep(delay);
-        if timer.elapsed().as_secs() >= 300 {
-            if let Ok(db) = db.lock() {
-                let count = count_list(&db, "", "", true);
-                info!("Currently blocked IP count: {}", count);
+    // If there is readable pipe to read we read it in a loop
+    if let Ok(f) = File::open(&config.pipe_path) {
+        let mut reader = BufReader::new(f);
+        info!("Pipe opened, waiting for IPs");
+
+        let mut line = String::new();
+        let mut timer = Instant::now();
+        let delay = Duration::from_millis(5);
+        loop {
+            if let Ok(len) = reader.read_line(&mut line) {
+                if len > 0 {
+                    let ip = line.trim().to_owned();
+                    let (ip, timeout) = if ip.contains(" ") {
+                        let parts = ip.split(" ").collect::<Vec<_>>();
+                        (parts[0].to_owned(), parts[1].parse::<i64>().unwrap_or(DEFAULT_TIMEOUT))
+                    } else {
+                        (ip, DEFAULT_TIMEOUT)
+                    };
+                    info!("Got new IP from server pipe: {}", &ip);
+                    if let Ok(db) = db.lock() {
+                        let _ = add_to_list(&db, "", "", true, &ip, timeout);
+                    }
+                    let msg = if timeout == DEFAULT_TIMEOUT {
+                        ip
+                    } else {
+                        format!("{} timeout {}", &ip, timeout)
+                    };
+                    match nats.publish(&config.nats.bl_global_subject, &msg) {
+                        Ok(_) => info!("Pushed {} to [{}]", &msg, &config.nats.bl_global_subject),
+                        Err(e) => warn!("Error pushing {} to [{}]: {}", &msg, &config.nats.bl_global_subject, e)
+                    }
+                } else {
+                    thread::sleep(delay);
+                    if timer.elapsed().as_secs() >= 300 {
+                        if let Ok(db) = db.lock() {
+                            let count = count_list(&db, "", "", true);
+                            info!("Currently blocked IP count: {}", count);
+                        }
+                        timer = Instant::now();
+                    }
+                }
             }
-            timer = Instant::now();
+            line.clear();
+        }
+    } else {
+        // If there is no pipe we just loop here until we die
+        let delay = Duration::from_secs(1);
+        let mut timer = Instant::now();
+        loop {
+            thread::sleep(delay);
+            if timer.elapsed().as_secs() >= 300 {
+                if let Ok(db) = db.lock() {
+                    let count = count_list(&db, "", "", true);
+                    info!("Currently blocked IP count: {}", count);
+                }
+                timer = Instant::now();
+            }
         }
     }
 }
@@ -250,7 +299,7 @@ fn send_clickhouse_request(agent: &Agent, config: &Config, request: &str) {
 }
 
 fn get_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: bool) -> String {
-    let until = OffsetDateTime::now_utc().unix_timestamp();
+    let now = OffsetDateTime::now_utc().unix_timestamp();
     let mut result = String::new();
     let blacklist = match blacklist {
         true => 1,
@@ -261,11 +310,20 @@ fn get_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: bo
             statement.bind(1, client).expect("Error in bind");
             statement.bind(2, hostname).expect("Error in bind");
             statement.bind(3, blacklist).expect("Error in bind");
-            statement.bind(4, until).expect("Error in bind");
+            statement.bind(4, now).expect("Error in bind");
             while statement.next().unwrap() == State::Row {
-                if let Ok(string) = statement.read::<String>(0) {
+                if let Ok(mut string) = statement.read::<String>(0) {
+                    let until = statement.read::<i64>(1).unwrap_or(0);
                     if !result.is_empty() {
                         result.push('\n');
+                    }
+                    let mut timeout = until - now;
+                    if timeout > 86400 {
+                        // ipset supports timeouts only until 2147483 :(
+                        if timeout > 2147483 {
+                            timeout = 2147483;
+                        }
+                        string = format!("{} timeout {}", &string, timeout);
                     }
                     result.push_str(&string);
                 }
@@ -278,8 +336,8 @@ fn get_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: bo
     result
 }
 
-fn add_to_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: bool, ip: &str) -> sqlite::Result<State> {
-    let until = OffsetDateTime::now_utc().unix_timestamp() + 86400;
+fn add_to_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: bool, ip: &str, timeout: i64) -> sqlite::Result<State> {
+    let until = OffsetDateTime::now_utc().unix_timestamp() + timeout;
     let mut statement = db.prepare(GET_COUNT)?;
     statement.bind(1, client)?;
     statement.bind(2, blacklist as i64)?;
