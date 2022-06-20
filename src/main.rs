@@ -22,6 +22,7 @@ use crate::timer::HourlyTimer;
 use crate::types::Stats;
 use crate::utils::reduce_spaces;
 use lru::LruCache;
+use crate::install::uninstall_client;
 
 mod config;
 mod ipset;
@@ -96,15 +97,32 @@ fn main() -> Result<(), i32> {
     if opt_matches.opt_present("update") {
         #[cfg(windows)]
         {
-            error!("Installing DisWall on Windows is not supported!");
+            error!("Updating DisWall on Windows is not supported!");
             return Err(110);
         }
         #[cfg(not(windows))]
         {
             info!("Updating DisWall v{}", env!("CARGO_PKG_VERSION"));
             if let Err(e) = update_client() {
-                error!("Error installing DisWall: {}", &e);
+                error!("Error updating DisWall: {}", &e);
                 return Err(101);
+            }
+            return Ok(());
+        }
+    }
+
+    if opt_matches.opt_present("uninstall") {
+        #[cfg(windows)]
+        {
+            error!("Uninstalling DisWall on Windows is not supported!");
+            return Err(110);
+        }
+        #[cfg(not(windows))]
+        {
+            info!("Uninstalling DisWall v{}", env!("CARGO_PKG_VERSION"));
+            if let Err(e) = uninstall_client() {
+                error!("Error uninstalling DisWall: {}", &e);
+                return Err(102);
             }
             return Ok(());
         }
@@ -386,6 +404,7 @@ fn get_options(args: &Vec<String>) -> (Options, Matches) {
     opts.optflag("v", "version", "Print version and exit");
     opts.optflag("", "install", "Install DisWall as system service (in client mode)");
     opts.optflag("", "update", "Update DisWall to latest release from GitHub");
+    opts.optflag("", "uninstall", "Uninstall DisWall from your server");
     opts.optflag("d", "debug", "Show trace messages, more than debug");
     opts.optflag("g", "generate", "Generate fresh configuration file. It is better to redirect contents to file.");
     opts.optopt("c", "config", "Set configuration file path", "FILE");

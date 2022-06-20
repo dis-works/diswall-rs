@@ -2,7 +2,7 @@
 name = "diswall"
 version = "0.1.6"
 edition = "2021"
-homepage = "https://diswall.jamm.me"
+homepage = "https://diswall.stream"
 repository = "https://github.com/dis-works/diswall-rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

@@ -184,6 +184,66 @@ pub(crate) fn update_client() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
+pub(crate) fn uninstall_client() -> io::Result<()> {
+    use std::fs;
+
+    // Stopping service
+    match Command::new("systemctl")
+        .arg("disable")
+        .arg("--now")
+        .arg("diswall")
+        .stdout(Stdio::null()).spawn() {
+        Ok(mut child) => {
+            if let Ok(r) = child.wait() {
+                if r.success() {
+                    info!("Service stopped and disabled");
+                }
+            }
+        }
+        Err(e) => return Err(e)
+    }
+
+    match Command::new("iptables")
+        .arg("-F")
+        .arg("INPUT")
+        .stdout(Stdio::null()).spawn() {
+        Ok(mut child) => {
+            if let Ok(r) = child.wait() {
+                if r.success() {
+                    info!("Iptables INPUT table flushed successfully");
+                }
+            }
+        }
+        Err(e) => return Err(e)
+    }
+
+    fs::remove_file(LOG_PATH)?;
+    match Command::new("systemctl")
+        .arg("restart")
+        .arg("rsyslog")
+        .stdout(Stdio::null()).spawn() {
+        Ok(mut child) => {
+            if let Ok(r) = child.wait() {
+                if r.success() {
+                    info!("Rsyslogd restarted successfully");
+                }
+            }
+        }
+        Err(e) => return Err(e)
+    }
+
+    let _ = fs::remove_file(UNIT_PATH);
+    let _ = fs::remove_file(UNIT_FW_PATH);
+    let _ = fs::remove_file(CONFIG_PATH);
+    let _ = fs::remove_file(INIT_PATH);
+    let _ = fs::remove_file(format!("{}.old", BIN_PATH));
+    let _ = fs::remove_file(BIN_PATH);
+    info!("Removed all DisWall files");
+
+    Ok(())
+}
+
 fn get_listening_services() -> HashSet<Service> {
     let mut result = HashSet::new();
 
