@@ -39,6 +39,19 @@ pub(crate) fn install_client() -> io::Result<()> {
         fs::create_dir_all("/etc/rsyslog.d/")?;
         fs::write(LOG_PATH, include_bytes!("../scripts/10-diswall.conf"))?;
         info!("Created rsyslogd config file: {}", LOG_PATH);
+        match Command::new("systemctl")
+            .arg("restart")
+            .arg("rsyslog")
+            .stdout(Stdio::null()).spawn() {
+            Ok(mut child) => {
+                if let Ok(r) = child.wait() {
+                    if r.success() {
+                        info!("Rsyslogd restarted successfully");
+                    }
+                }
+            }
+            Err(e) => return Err(e)
+        }
     }
     // Adding systemd service for diswall
     if Path::new(UNIT_PATH).exists() {
@@ -237,6 +250,7 @@ pub(crate) fn uninstall_client() -> io::Result<()> {
     let _ = fs::remove_file(UNIT_FW_PATH);
     let _ = fs::remove_file(CONFIG_PATH);
     let _ = fs::remove_file(INIT_PATH);
+    let _ = fs::remove_file(PIPE_PATH);
     let _ = fs::remove_file(format!("{}.old", BIN_PATH));
     let _ = fs::remove_file(BIN_PATH);
     info!("Removed all DisWall files");
