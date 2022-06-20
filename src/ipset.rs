@@ -27,10 +27,13 @@ pub fn run_ipset(action: &str, list_name: &str, data: &str, comment: Option<Stri
         } else {
             args.push(&data);
         }
+        let mut buf = String::new();
         if let Some(comment) = comment {
+            buf.push_str(&comment);
             args.push("comment");
-            args.push(&comment);
+            args.push(&buf);
         }
+        command.args(&args);
         match command.stdout(Stdio::null()).spawn() {
             Err(e) => {
                 match action {
