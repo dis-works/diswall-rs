@@ -140,6 +140,8 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
                 }
                 let request = format!("INSERT INTO scanners VALUES ({}, {}, '{}')", &client_mix, time, &ip);
                 send_clickhouse_request(&agent, &config, &request);
+                let request = format!("INSERT INTO nats_data (client, hostname, blacklist, ip, until) VALUES ('{}', '{}', {}, '{}', {})", &client, &hostname, 1, &ip, time + 86400);
+                send_clickhouse_request(&agent, &config, &request);
             }
             Ok(())
         });
@@ -219,6 +221,11 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
                     let msg = if timeout == DEFAULT_TIMEOUT {
                         ip
                     } else {
+                        let timeout = if timeout > 2147483 {
+                            2147483
+                        } else {
+                            timeout
+                        };
                         format!("{} timeout {}", &ip, timeout)
                     };
                     match nats.publish(&config.nats.bl_global_subject, &msg) {
@@ -318,13 +325,11 @@ fn get_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: bo
                         result.push('\n');
                     }
                     let mut timeout = until - now;
-                    if timeout > 86400 {
-                        // ipset supports timeouts only until 2147483 :(
-                        if timeout > 2147483 {
-                            timeout = 2147483;
-                        }
-                        string = format!("{} timeout {}", &string, timeout);
+                    // ipset supports timeouts only until 2147483 :(
+                    if timeout > 2147483 {
+                        timeout = 2147483;
                     }
+                    string = format!("{} timeout {}", &string, timeout);
                     result.push_str(&string);
                 }
             }
