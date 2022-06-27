@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::net::{IpAddr};
 use std::process::{Command, exit, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use getopts::{Matches, Options};
@@ -193,8 +193,9 @@ fn main() -> Result<(), i32> {
             let banned_count = banned_count.clone();
             let list_name = config.ipset_black_list.clone();
             let subject = config.nats.stats_subject.clone();
+            let prev_stats = Arc::new(RwLock::new(Stats::default()));
             let mut timer = HourlyTimer::new(move || {
-                collect_stats(&list_name, &subject, &nats, &banned_count);
+                collect_stats(&list_name, &subject, &nats, &banned_count, &prev_stats);
             });
             let _ = timer.start();
         }
@@ -515,7 +516,7 @@ pub fn kill_connection(ip: &str) -> bool {
 }
 
 /// Collects statistics about dropped packets and dropped bytes from iptables
-fn collect_stats(list_name: &str, subject: &str, nats: &Connection, banned_count: &Arc<AtomicU32>) {
+fn collect_stats(list_name: &str, subject: &str, nats: &Connection, banned_count: &Arc<AtomicU32>, prev_stats: &RwLock<Stats>) {
     let command = Command::new("iptables")
         .arg("-nxvL")
         .arg("INPUT")
@@ -538,6 +539,7 @@ fn collect_stats(list_name: &str, subject: &str, nats: &Connection, banned_count
                             // We clear banned count every hour
                             banned_count.store(0u32, Ordering::SeqCst);
                             let mut stats = Stats { time, banned, packets_dropped: 0, bytes_dropped: 0, packets_accepted: 0, bytes_accepted: 0 };
+                            let mut stats_to_push = Stats::default();
                             for line in lines {
                                 let text = reduce_spaces(line);
                                 let parts = text.trim().split(" ").collect::<Vec<&str>>();
@@ -554,14 +556,28 @@ fn collect_stats(list_name: &str, subject: &str, nats: &Connection, banned_count
                                     stats.bytes_dropped = parts[1].parse::<u64>().unwrap_or(0u64);
                                 }
                             }
-                            info!("Statistics: {:?}", &stats);
-                            let data = serde_json::to_string(&stats).unwrap_or(String::from("Error serializing stats"));
+                            // First time after service restart we send 0 stats about accepted and dropped packets
+                            if prev_stats.read().unwrap().time == 0 {
+                                stats_to_push.time = stats.time;
+                                stats_to_push.banned = stats.banned;
+                            } else {
+                                // But the second time we subtract previous stats, to make numbers for this hour only
+                                let prev = prev_stats.read().unwrap();
+                                stats.bytes_accepted -= prev.bytes_accepted;
+                                stats.bytes_dropped -= prev.bytes_dropped;
+                                stats.packets_accepted -= prev.packets_accepted;
+                                stats.packets_dropped -= prev.packets_dropped;
+                                stats_to_push.copy_from(&stats);
+                            }
+                            info!("Statistics: {:?}", &stats_to_push);
+                            let data = serde_json::to_string(&stats_to_push).unwrap_or(String::from("Error serializing stats"));
                             // To distribute somehow requests to NATS server we make a random delay
                             let delay = Duration::from_secs(rand::random::<u64>() % 60);
                             thread::sleep(delay);
                             if let Err(e) = nats.publish(subject, &data) {
                                 warn!("Could not send stats to NATS server: {}", e);
                             }
+                            prev_stats.write().unwrap().copy_from(&stats);
                         }
                     }
                 },
