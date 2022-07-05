@@ -2,7 +2,7 @@ use std::convert::Infallible;
 use std::{env, io, thread};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::net::{IpAddr};
+use std::net::IpAddr;
 use std::process::{Command, exit, Stdio};
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -20,8 +20,9 @@ use crate::server::run_server;
 use crate::install::{install_client, update_client};
 use crate::timer::HourlyTimer;
 use crate::types::Stats;
-use crate::utils::reduce_spaces;
+use crate::utils::{get_ip_and_tag, reduce_spaces};
 use lru::LruCache;
+use utils::valid_ip;
 use crate::install::uninstall_client;
 
 mod config;
@@ -213,7 +214,7 @@ fn process_ips_from_parameters(config: &Config, opt_matches: &Matches, nats: Opt
             None => None,
             Some(s) => Some(s)
         };
-        modify_list(true, &nats, &config.ipset_white_list, &config.nats.wl_add_subject, &ip, comment);
+        modify_list(true, &nats, &config.ipset_white_list, &config.nats.wl_push_subject, &ip, comment);
         return true;
     }
 
@@ -223,7 +224,7 @@ fn process_ips_from_parameters(config: &Config, opt_matches: &Matches, nats: Opt
     }
 
     if let Some(ip) = opt_matches.opt_str("bl-add-ip") {
-        modify_list(true, &nats, &config.ipset_black_list, &config.nats.bl_add_subject, &ip, None);
+        modify_list(true, &nats, &config.ipset_black_list, &config.nats.bl_push_subject, &ip, None);
         let _ = kill_connection(&ip);
         return true;
     }
@@ -260,7 +261,7 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection) {
     }
 
     // Subscribe to new IPs for whitelist
-    if let Ok(sub) = nats.subscribe(&config.nats.wl_add_subject) {
+    if let Ok(sub) = nats.subscribe(&config.nats.wl_subscribe_subject) {
         let list_name = config.ipset_white_list.clone();
         sub.with_handler(move |message| {
             if let Ok(string) = String::from_utf8(message.data) {
@@ -276,20 +277,30 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection) {
             }
             Ok(())
         });
-        info!("Subscribed to {}", &config.nats.wl_add_subject);
+        info!("Subscribed to {}", &config.nats.wl_subscribe_subject);
     }
 
     // Subscribe for new IPs for blocklist
-    if let Ok(sub) = nats.subscribe(&config.nats.bl_add_subject) {
+    if let Ok(sub) = nats.subscribe(&config.nats.bl_subscribe_subject) {
         let list_name = config.ipset_black_list.clone();
         sub.with_handler(move |message| {
             if let Ok(string) = String::from_utf8(message.data) {
-                ipset::run_ipset("add", &list_name, &string, None);
-                let _ = kill_connection(&string);
+                debug!("Got ip from my subject: {}", &string);
+                let (ip, tag) = get_ip_and_tag(&string);
+                if !valid_ip(&ip) {
+                    warn!("Could not parse IP {} from {}", &ip, &string);
+                    return Ok(());
+                }
+                if tag.len() > 25 {
+                    warn!("Too long tag '{}' from {}", &tag, &string);
+                    return Ok(());
+                }
+                ipset::run_ipset("add", &list_name, &ip, None);
+                let _ = kill_connection(&ip);
             }
             Ok(())
         });
-        info!("Subscribed to {}", &config.nats.bl_add_subject);
+        info!("Subscribed to {}", &config.nats.bl_subscribe_subject);
     }
 
     // Subscribe for new IPs for blocklist
@@ -297,6 +308,7 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection) {
         let list_name = config.ipset_black_list.clone();
         sub.with_handler(move |message| {
             if let Ok(string) = String::from_utf8(message.data) {
+                debug!("Got ip from global subject: {}", &string);
                 ipset::run_ipset("add", &list_name, &string, None);
                 let _ = kill_connection(&string);
             }
@@ -345,14 +357,23 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
     loop {
         let len = reader.read_line(&mut line)?;
         if len > 0 {
-            let ip = line.trim().to_owned();
+            let (ip, tag) = get_ip_and_tag(line.trim());
+            if !valid_ip(&ip) {
+                warn!("Could not parse IP {} from {}", &ip, &line);
+                continue;
+            }
+            if tag.len() > 25 {
+                warn!("Too long tag '{}' from {}", &tag, &line);
+                continue;
+            }
+
             if cache.contains(&ip) {
                 debug!("Already banned {}", &ip);
                 line.clear();
                 continue;
             }
             debug!("Got new IP: {}", &ip);
-            modify_list(true, &nats, &block_list, &config.nats.bl_add_subject, &ip, None);
+            modify_list(true, &nats, &block_list, &config.nats.bl_push_subject, line.trim(), None);
             let _ = kill_connection(&ip);
             let _ = banned_count.fetch_add(1u32, Ordering::SeqCst);
             cache.push(ip, true);
@@ -368,20 +389,46 @@ fn modify_list(add: bool, nats: &Option<Connection>, list: &str, subject: &str, 
         true => "add",
         false => "del"
     };
-    if let Ok(addr) = line.parse::<IpAddr>() {
+
+    let (ip, tag) = if line.contains("|") {
+        let parts = line.split("|").collect::<Vec<_>>();
+        (parts[0].to_owned(), parts[1].to_owned())
+    } else {
+        (line.to_owned(), String::new())
+    };
+    if !valid_ip(&ip) {
+        warn!("Could not parse IP {} from {}", &ip, &line);
+        return;
+    }
+    if tag.len() > 25 {
+        warn!("Too long tag '{}' from {}", &tag, &line);
+        return;
+    }
+
+    if let Ok(addr) = ip.parse::<IpAddr>() {
         match addr {
             IpAddr::V4(ip) => {
                 if !ip.is_private() && !ip.is_loopback() && !ip.is_unspecified() {
                     debug!("{} {} to/from {}", action, line, list);
-                    ipset::run_ipset(action, &list, line, comment);
-                    push_to_nats(&nats, subject, ip.to_string());
+                    let ip = ip.to_string();
+                    ipset::run_ipset(action, &list, &ip, comment);
+                    if !tag.is_empty() {
+                        push_to_nats(&nats, subject, format!("{}|{}", &ip, tag));
+                    } else {
+                        push_to_nats(&nats, subject, ip);
+                    }
                 }
             }
             IpAddr::V6(ip) => {
                 if !ip.is_loopback() && !ip.is_unspecified() {
                     debug!("{} {} to/from {}", action, line, list);
-                    ipset::run_ipset(action, &list, line, comment);
-                    push_to_nats(&nats, subject, ip.to_string());
+                    let ip = ip.to_string();
+                    ipset::run_ipset(action, &list, &ip, comment);
+                    if !tag.is_empty() {
+                        push_to_nats(&nats, subject, format!("{}|{}", &ip, tag));
+                    } else {
+                        push_to_nats(&nats, subject, ip);
+                    }
                 }
             }
         }

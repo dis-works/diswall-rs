@@ -10,8 +10,9 @@ use nats::Connection;
 use sqlite::State;
 use time::OffsetDateTime;
 use ureq::Agent;
-use crate::{Config, Stats};
+use crate::{Config, Stats, utils};
 use crate::config::{PREFIX_BL, PREFIX_STATS, PREFIX_WL};
+use crate::utils::get_ip_and_tag;
 
 pub const DB_NAME: &str = "diswall.db";
 pub const CREATE_DB: &str = include_str!("../data/create_db.sql");
@@ -77,13 +78,13 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
     }
 
     // Subscribe to new IPs for whitelist
-    if let Ok(sub) = nats.subscribe(&config.nats.wl_add_subject) {
+    if let Ok(sub) = nats.subscribe(&config.nats.wl_subscribe_subject) {
         let db = db.clone();
         sub.with_handler(move |message| {
             debug!("Got message on {}", &message.subject);
             let (client, hostname) = get_user_and_host(&message.subject);
             if let Ok(string) = String::from_utf8(message.data) {
-                if !valid_ip(&string) {
+                if !utils::valid_ip(&string) {
                     warn!("Could not parse IP {} from {}", &string, &client);
                     return Ok(());
                 }
@@ -95,7 +96,7 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
             }
             Ok(())
         });
-        info!("Subscribed to {}", &config.nats.wl_add_subject);
+        info!("Subscribed to {}", &config.nats.wl_subscribe_subject);
     }
 
     let agent = ureq::AgentBuilder::new()
@@ -106,20 +107,27 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
         .build();
 
     // Subscribe for new IPs for blocklist
-    if let Ok(sub) = nats.subscribe(&config.nats.bl_add_subject) {
+    if let Ok(sub) = nats.subscribe(&config.nats.bl_subscribe_subject) {
         let db = db.clone();
         let nats = nats.clone();
         let config = config.clone();
         let agent = agent.clone();
-        let subject = config.nats.bl_add_subject.clone();
+        let subject = config.nats.bl_subscribe_subject.clone();
         sub.with_handler(move |message| {
             let (client, hostname) = get_user_and_host(&message.subject);
             debug!("Got message on {} from {:?}", &message.subject, (&client, &hostname));
-            if let Ok(ip) = String::from_utf8(message.data) {
-                if !valid_ip(&ip) {
+            if let Ok(data) = String::from_utf8(message.data) {
+                // If the client sent us the tag
+                let (ip, mut tag) = get_ip_and_tag(&data);
+                if !utils::valid_ip(&ip) {
                     warn!("Could not parse IP {} from {}", &ip, &client);
                     return Ok(());
                 }
+                if tag.len() > 25 {
+                    warn!("Too long tag '{}' from {}", &tag, &client);
+                    return Ok(());
+                }
+                info!("Got IP {} with tag '{}'", &ip, &tag);
                 let time = OffsetDateTime::now_utc().unix_timestamp();
                 let client_mix = mix_client(format!("{}/{}/{}", &client, &hostname, &config.clickhouse.salt).as_bytes());
                 // If this IP was sent by one of our honeypots we add this IP without client and hostname
@@ -137,8 +145,11 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
                         Ok(_) => info!("Pushed {} to [{}]", &ip, &config.nats.bl_global_subject),
                         Err(e) => warn!("Error pushing {} to [{}]: {}", &ip, &config.nats.bl_global_subject, e)
                     }
+                } else {
+                    // We push tag only from honeypots
+                    tag.clear();
                 }
-                let request = format!("INSERT INTO scanners VALUES ({}, {}, '{}')", &client_mix, time, &ip);
+                let request = format!("INSERT INTO scanners VALUES ({}, {}, '{}', '{}')", &client_mix, time, &ip, &tag);
                 send_clickhouse_request(&agent, &config, &request);
                 let request = format!("INSERT INTO nats_data (client, hostname, blacklist, ip, until) VALUES ('{}', '{}', {}, '{}', {})", &client, &hostname, 1, &ip, time + 86400);
                 send_clickhouse_request(&agent, &config, &request);
@@ -155,7 +166,7 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
             let (client, hostname) = get_user_and_host(&message.subject);
             debug!("Got message on {} from {:?}", &message.subject, (&client, &hostname));
             if let Ok(string) = String::from_utf8(message.data) {
-                if !valid_ip(&string) {
+                if !utils::valid_ip(&string) {
                     warn!("Could not parse IP {} from {}", &string, &client);
                     return Ok(());
                 }
@@ -177,7 +188,7 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
             let (client, hostname) = get_user_and_host(&message.subject);
             debug!("Got message on {} from {:?}", &message.subject, (&client, &hostname));
             if let Ok(string) = String::from_utf8(message.data) {
-                if !valid_ip(&string) {
+                if !utils::valid_ip(&string) {
                     warn!("Could not parse IP {} from {}", &string, &client);
                     return Ok(());
                 }
@@ -446,13 +457,6 @@ pub fn get_user_and_host(subject: &str) -> (String, String) {
     match split.len() {
         2 => (split[0].to_owned(), split[1].to_owned()),
         _ => (split[0].to_owned(), String::new())
-    }
-}
-
-pub fn valid_ip(ip: &str) -> bool {
-    match ip.parse::<IpAddr>() {
-        Ok(_) => true,
-        Err(_) => false,
     }
 }
 

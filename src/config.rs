@@ -87,11 +87,13 @@ impl Config {
             };
 
             self.nats.wl_init_subject = format!("{}.{}.init.{}", PREFIX_WL, client, host);
-            self.nats.wl_add_subject = format!("{}.{}.add.{}", PREFIX_WL, client, host);
+            self.nats.wl_push_subject = format!("{}.{}.add.{}", PREFIX_WL, client, host);
+            self.nats.wl_subscribe_subject = format!("{}.{}.add.*", PREFIX_WL, client);
             self.nats.wl_del_subject = format!("{}.{}.del.{}", PREFIX_WL, client, host);
 
             self.nats.bl_init_subject = format!("{}.{}.init.{}", PREFIX_BL, client, host);
-            self.nats.bl_add_subject = format!("{}.{}.add.{}", PREFIX_BL, client, host);
+            self.nats.bl_push_subject = format!("{}.{}.add.{}", PREFIX_BL, client, host);
+            self.nats.bl_subscribe_subject = format!("{}.{}.add.*", PREFIX_BL, client);
             self.nats.bl_del_subject = format!("{}.{}.del.{}", PREFIX_BL, client, host);
 
             self.nats.stats_subject = format!("{}.{}.add.{}", PREFIX_STATS, client, host);
@@ -129,12 +131,16 @@ pub struct NatsConfig {
     pub bl_init_subject: String,
     #[serde(default = "default_wl_init_subject")]
     pub wl_init_subject: String,
+    #[serde(default)]
+    pub bl_push_subject: String,
     #[serde(default = "default_bl_add_subject")]
-    pub bl_add_subject: String,
+    pub bl_subscribe_subject: String,
     #[serde(default = "default_bl_del_subject")]
     pub bl_del_subject: String,
+    #[serde(default)]
+    pub wl_push_subject: String,
     #[serde(default = "default_wl_add_subject")]
-    pub wl_add_subject: String,
+    pub wl_subscribe_subject: String,
     #[serde(default = "default_wl_del_subject")]
     pub wl_del_subject: String,
     #[serde(default = "default_bl_global_subject")]
@@ -155,8 +161,10 @@ impl Default for NatsConfig {
             hostname: default_hostname(),
             bl_init_subject: default_bl_init_subject(),
             wl_init_subject: default_wl_init_subject(),
-            bl_add_subject: default_bl_add_subject(),
-            wl_add_subject: default_wl_add_subject(),
+            bl_push_subject: String::new(),
+            bl_subscribe_subject: default_bl_add_subject(),
+            wl_push_subject: String::new(),
+            wl_subscribe_subject: default_wl_add_subject(),
             bl_del_subject: default_bl_del_subject(),
             wl_del_subject: default_wl_del_subject(),
             bl_global_subject: default_bl_global_subject(),
