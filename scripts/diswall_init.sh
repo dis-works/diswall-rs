@@ -13,6 +13,10 @@ iptables -A INPUT -i lo -j ACCEPT
 # For rare conditions
 iptables -A OUTPUT -p udp -m state --state NEW,ESTABLISHED -j ACCEPT
 
+# For timed out responses from DNS servers
+iptables -A INPUT -p udp --sport 53 -j ACCEPT
+iptables -A INPUT -p tcp --sport 53 -j ACCEPT
+
 # Allow all IPs from diswall-wl
 iptables -A INPUT -m set --match-set diswall-wl src -j ACCEPT
 

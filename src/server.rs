@@ -1,7 +1,6 @@
 use std::fs::File;
 use std::hash::Hasher;
 use std::io::{BufRead, BufReader};
-use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};

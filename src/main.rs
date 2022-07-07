@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::net::IpAddr;
 use std::process::{Command, exit, Stdio};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use getopts::{Matches, Options};
@@ -130,6 +130,7 @@ fn main() -> Result<(), i32> {
     }
 
     debug!("Loaded config:\n{:#?}", &config);
+    let cache = Arc::new(Mutex::new(LruCache::new(8)));
 
     let nats = if !config.local_only && !config.nats.server.is_empty() {
         //let hostname = config::get_hostname();
@@ -150,7 +151,7 @@ fn main() -> Result<(), i32> {
                 }
                 if !config.server_mode {
                     info!("Connected to NATS server, setting up handlers");
-                    start_nats_handlers(&mut config, &nats);
+                    start_nats_handlers(&mut config, &nats, Arc::clone(&cache));
                 }
                 Some(nats)
             }
@@ -202,7 +203,7 @@ fn main() -> Result<(), i32> {
         }
     }
 
-    if let Err(e) = lock_on_pipe(config, nats, &banned_count) {
+    if let Err(e) = lock_on_pipe(config, nats, &banned_count, Arc::clone(&cache)) {
         error!("Error reading pipe: {}", e);
     }
     Ok(())
@@ -237,7 +238,7 @@ fn process_ips_from_parameters(config: &Config, opt_matches: &Matches, nats: Opt
     false
 }
 
-fn start_nats_handlers(config: &mut Config, nats: &Connection) {
+fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<LruCache<String, bool>>>) {
     let msg = String::new();
     if let Ok(message) = nats.request(&config.nats.wl_init_subject, &msg) {
         let string = String::from_utf8(message.data).unwrap_or(String::default());
@@ -283,13 +284,19 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection) {
     // Subscribe for new IPs for blocklist
     if let Ok(sub) = nats.subscribe(&config.nats.bl_subscribe_subject) {
         let list_name = config.ipset_black_list.clone();
+        let cache = Arc::clone(&cache);
         sub.with_handler(move |message| {
             if let Ok(string) = String::from_utf8(message.data) {
-                debug!("Got ip from my subject: {}", &string);
+                //trace!("Got ip from my subject: {}", &string);
                 let (ip, tag) = get_ip_and_tag(&string);
                 if !valid_ip(&ip) {
                     warn!("Could not parse IP {} from {}", &ip, &string);
                     return Ok(());
+                }
+                if let Ok(cache) = cache.lock() {
+                    if cache.contains(&ip) {
+                        return Ok(());
+                    }
                 }
                 if tag.len() > 25 {
                     warn!("Too long tag '{}' from {}", &tag, &string);
@@ -297,6 +304,9 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection) {
                 }
                 ipset::run_ipset("add", &list_name, &ip, None);
                 let _ = kill_connection(&ip);
+                if let Ok(mut cache) = cache.lock() {
+                    cache.push(ip, true);
+                }
             }
             Ok(())
         });
@@ -306,11 +316,29 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection) {
     // Subscribe for new IPs for blocklist
     if let Ok(sub) = nats.subscribe(&config.nats.bl_global_subject) {
         let list_name = config.ipset_black_list.clone();
+        let cache = Arc::clone(&cache);
         sub.with_handler(move |message| {
             if let Ok(string) = String::from_utf8(message.data) {
-                debug!("Got ip from global subject: {}", &string);
-                ipset::run_ipset("add", &list_name, &string, None);
-                let _ = kill_connection(&string);
+                //trace!("Got ip from global subject: {}", &string);
+                let (ip, tag) = get_ip_and_tag(&string);
+                if !valid_ip(&ip) {
+                    warn!("Could not parse IP {} from {}", &ip, &string);
+                    return Ok(());
+                }
+                if let Ok(cache) = cache.lock() {
+                    if cache.contains(&ip) {
+                        return Ok(());
+                    }
+                }
+                if tag.len() > 25 {
+                    warn!("Too long tag '{}' from {}", &tag, &string);
+                    return Ok(());
+                }
+                ipset::run_ipset("add", &list_name, &ip, None);
+                let _ = kill_connection(&ip);
+                if let Ok(mut cache) = cache.lock() {
+                    cache.push(ip, true);
+                }
             }
             Ok(())
         });
@@ -345,7 +373,7 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection) {
 }
 
 /// The main function, that reads iptables log and works with IPs
-fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<AtomicU32>) -> Result<Infallible, io::Error> {
+fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<AtomicU32>, cache: Arc<Mutex<LruCache<String, bool>>>) -> Result<Infallible, io::Error> {
     let f = File::open(&config.pipe_path)?;
     let mut reader = BufReader::new(f);
 
@@ -353,7 +381,6 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
     let block_list = config.ipset_black_list.as_str();
     let mut line = String::new();
     let delay = Duration::from_millis(5);
-    let mut cache = LruCache::new(5);
     loop {
         let len = reader.read_line(&mut line)?;
         if len > 0 {
@@ -367,16 +394,25 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
                 continue;
             }
 
-            if cache.contains(&ip) {
-                debug!("Already banned {}", &ip);
-                line.clear();
-                continue;
+            if let Ok(cache) = cache.lock() {
+                if cache.contains(&ip) {
+                    debug!("Already banned {}", &ip);
+                    line.clear();
+                    continue;
+                }
             }
-            debug!("Got new IP: {}", &ip);
+            if !tag.is_empty() {
+                debug!("Got new IP: {} with tag '{}'", &ip, &tag);
+            } else {
+                debug!("Got new IP: {}", &ip);
+            }
+            // We push this IP to cache before we push it to NATS to avoid duplication
+            if let Ok(mut cache) = cache.lock() {
+                cache.push(ip.clone(), true);
+            }
             modify_list(true, &nats, &block_list, &config.nats.bl_push_subject, line.trim(), None);
             let _ = kill_connection(&ip);
             let _ = banned_count.fetch_add(1u32, Ordering::SeqCst);
-            cache.push(ip, true);
         } else {
             thread::sleep(delay);
         }
