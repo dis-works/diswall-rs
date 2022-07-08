@@ -600,6 +600,7 @@ pub fn kill_connection(ip: &str) -> bool {
 
 /// Collects statistics about dropped packets and dropped bytes from iptables
 fn collect_stats(list_name: &str, subject: &str, nats: &Connection, banned_count: &Arc<AtomicU32>, prev_stats: &RwLock<Stats>) {
+    let time = OffsetDateTime::now_utc().unix_timestamp();
     let command = Command::new("iptables")
         .arg("-nxvL")
         .arg("INPUT")
@@ -617,7 +618,6 @@ fn collect_stats(list_name: &str, subject: &str, nats: &Connection, banned_count
                         let mut buf = String::new();
                         if let Ok(_) = out.read_to_string(&mut buf) {
                             let lines = buf.split("\n").collect::<Vec<&str>>();
-                            let time = OffsetDateTime::now_utc().unix_timestamp();
                             let banned = banned_count.load(Ordering::SeqCst);
                             // We clear banned count every hour
                             banned_count.store(0u32, Ordering::SeqCst);

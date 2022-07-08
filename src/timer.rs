@@ -25,6 +25,7 @@ impl HourlyTimer {
     fn start_loop(&mut self) {
         let stop = self.stop.clone();
         let second = Duration::from_secs(1);
+        let half_second = Duration::from_millis(500);
         if let Some(task) = self.task.take() {
             thread::spawn(move || {
                 loop {
@@ -33,12 +34,13 @@ impl HourlyTimer {
                     }
                     let now = OffsetDateTime::now_utc();
                     if now.minute() == 0 && now.second() == 0 {
-                        task()
+                        task();
+                        thread::sleep(second);
                     }
                     if stop.load(Ordering::SeqCst) {
                         break;
                     }
-                    thread::sleep(second);
+                    thread::sleep(half_second);
                 }
             });
         }
