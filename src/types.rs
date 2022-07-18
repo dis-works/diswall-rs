@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Statistics representation
-#[derive(Default, Serialize, Deserialize, Debug)]
+#[derive(Default, Clone, Serialize, Deserialize, Debug)]
 pub struct Stats {
     pub(crate) time: i64,
     pub(crate) banned: u32,

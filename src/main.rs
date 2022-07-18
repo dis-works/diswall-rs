@@ -622,7 +622,6 @@ fn collect_stats(list_name: &str, subject: &str, nats: &Connection, banned_count
                             // We clear banned count every hour
                             banned_count.store(0u32, Ordering::SeqCst);
                             let mut stats = Stats { time, banned, packets_dropped: 0, bytes_dropped: 0, packets_accepted: 0, bytes_accepted: 0 };
-                            let mut stats_to_push = Stats::default();
                             for line in lines {
                                 let text = reduce_spaces(line);
                                 let parts = text.trim().split(" ").collect::<Vec<&str>>();
@@ -639,18 +638,14 @@ fn collect_stats(list_name: &str, subject: &str, nats: &Connection, banned_count
                                     stats.bytes_dropped = parts[1].parse::<u64>().unwrap_or(0u64);
                                 }
                             }
-                            // First time after service restart we send 0 stats about accepted and dropped packets
-                            if prev_stats.read().unwrap().time == 0 {
-                                stats_to_push.time = stats.time;
-                                stats_to_push.banned = stats.banned;
-                            } else {
+                            let mut stats_to_push = stats.clone();
+                            {
                                 // But the second time we subtract previous stats, to make numbers for this hour only
                                 let prev = prev_stats.read().unwrap();
-                                stats.bytes_accepted -= prev.bytes_accepted;
-                                stats.bytes_dropped -= prev.bytes_dropped;
-                                stats.packets_accepted -= prev.packets_accepted;
-                                stats.packets_dropped -= prev.packets_dropped;
-                                stats_to_push.copy_from(&stats);
+                                stats_to_push.bytes_accepted -= prev.bytes_accepted;
+                                stats_to_push.bytes_dropped -= prev.bytes_dropped;
+                                stats_to_push.packets_accepted -= prev.packets_accepted;
+                                stats_to_push.packets_dropped -= prev.packets_dropped;
                             }
                             info!("Statistics: {:?}", &stats_to_push);
                             let data = serde_json::to_string(&stats_to_push).unwrap_or(String::from("Error serializing stats"));
