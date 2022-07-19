@@ -1,6 +1,6 @@
 [package]
 name = "diswall"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 homepage = "https://diswall.stream"
 repository = "https://github.com/dis-works/diswall-rs"
