@@ -316,7 +316,6 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
     // Subscribe for new IPs for blocklist
     if let Ok(sub) = nats.subscribe(&config.nats.bl_global_subject) {
         let list_name = config.ipset_black_list.clone();
-        let cache = Arc::clone(&cache);
         sub.with_handler(move |message| {
             if let Ok(string) = String::from_utf8(message.data) {
                 //trace!("Got ip from global subject: {}", &string);
@@ -325,20 +324,16 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
                     warn!("Could not parse IP {} from {}", &ip, &string);
                     return Ok(());
                 }
-                if let Ok(cache) = cache.lock() {
-                    if cache.contains(&ip) {
-                        return Ok(());
-                    }
-                }
                 if tag.len() > 25 {
                     warn!("Too long tag '{}' from {}", &tag, &string);
                     return Ok(());
                 }
-                ipset::run_ipset("add", &list_name, &ip, None);
+                let data = match tag.parse::<i64>() {
+                    Ok(timeout) => format!("{} timeout {}", &ip, timeout),
+                    Err(_) => ip.clone()
+                };
+                ipset::run_ipset("add", &list_name, &data, None);
                 let _ = kill_connection(&ip);
-                if let Ok(mut cache) = cache.lock() {
-                    cache.push(ip, true);
-                }
             }
             Ok(())
         });

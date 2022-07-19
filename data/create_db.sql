@@ -3,7 +3,8 @@ CREATE TABLE data (
     'hostname' VARCHAR(32),
     'blacklist' INT,
     'ip' VARCHAR(40),
-    'until' INT
+    'until' INT,
+    'bans' INT DEFAULT 1
 );
 
 CREATE INDEX client_host ON data (client, hostname);
