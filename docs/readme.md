@@ -114,5 +114,5 @@ This situation is horrible in real life, but in server administration world it i
 
 Port scans are indeed a common thing, we block about 1500 IPs that are scanning our honeypots in an hour. And almost any hacker attack start from port scan to determine all services that are open to an intruder.
 
-And the main goal of DisWall is to protect servers from this type of hostile activity. And we think that we've done a great job.
+Therefore, the main goal of DisWall is to protect servers from this type of hostile activity. And we think that we've done a great job.
 

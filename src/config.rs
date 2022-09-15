@@ -17,6 +17,8 @@ pub struct Config {
     pub pipe_path: String,
     #[serde(default)]
     pub nats: NatsConfig,
+    #[serde(skip)]
+    pub fw_type: FwType,
     #[serde(default)]
     pub clickhouse: ClickHouseConfig,
     #[serde(default)]
@@ -108,6 +110,7 @@ impl Default for Config {
         Config {
             pipe_path: default_pipe(),
             nats,
+            fw_type: FwType::IpTables,
             clickhouse,
             local_only: true,
             server_mode: false,
@@ -186,6 +189,13 @@ pub struct ClickHouseConfig {
     pub database: String,
     #[serde(default)]
     pub salt: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub enum FwType {
+    #[default]
+    IpTables,
+    NfTables
 }
 
 pub fn get_hostname() -> String {

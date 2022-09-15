@@ -12,9 +12,7 @@ use log::{debug, error, info, LevelFilter, trace, warn};
 use nats::Connection;
 use simplelog::{ColorChoice, CombinedLogger, ConfigBuilder, format_description, LevelPadding, TerminalMode, TermLogger, WriteLogger};
 use time::OffsetDateTime;
-use crate::config::Config;
-#[cfg(not(windows))]
-use crate::ipset::{ipset_list_create_bl, ipset_list_create_wl, ipset_list_exists};
+use crate::config::{Config, FwType};
 use crate::server::run_server;
 #[cfg(not(windows))]
 use crate::install::{install_client, update_client};
@@ -23,10 +21,11 @@ use crate::types::Stats;
 use crate::utils::{get_ip_and_tag, reduce_spaces};
 use lru::LruCache;
 use utils::valid_ip;
+#[cfg(not(windows))]
 use crate::install::uninstall_client;
 
 mod config;
-mod ipset;
+mod firewall;
 mod server;
 mod timer;
 mod types;
@@ -76,6 +75,13 @@ fn main() -> Result<(), i32> {
     // Override config options by options from arguments
     config.override_config_from_args(&opt_matches);
     config.init_nats_subjects();
+    match firewall::get_installed_fw_type() {
+        Ok(t) => config.fw_type = t,
+        Err(e) => {
+            error!("{}", e);
+            return Err(100);
+        }
+    }
     setup_logger(&opt_matches);
 
     if opt_matches.opt_present("install") {
@@ -170,25 +176,6 @@ fn main() -> Result<(), i32> {
         return Ok(());
     }
 
-    #[cfg(not(windows))]
-    {
-        if !ipset_list_exists(&config.ipset_black_list) {
-            info!("ipset list {} does not exist, creating", &config.ipset_black_list);
-            if !ipset_list_create_bl(&config.ipset_black_list) {
-                error!("Error creating ipset list {}", &config.ipset_black_list);
-                return Err(2);
-            }
-        }
-
-        if !ipset_list_exists(&config.ipset_white_list) {
-            info!("ipset list {} does not exist, creating", &config.ipset_white_list);
-            if !ipset_list_create_wl(&config.ipset_white_list) {
-                error!("Error creating ipset list {}", &config.ipset_white_list);
-                return Err(3);
-            }
-        }
-    }
-
     let banned_count = Arc::new(AtomicU32::new(0));
     if config.send_statistics {
         if let Some(nats) = nats.clone() {
@@ -215,23 +202,23 @@ fn process_ips_from_parameters(config: &Config, opt_matches: &Matches, nats: Opt
             None => None,
             Some(s) => Some(s)
         };
-        modify_list(true, &nats, &config.ipset_white_list, &config.nats.wl_push_subject, &ip, comment);
+        modify_list(&config.fw_type, true, &nats, &config.ipset_white_list, &config.nats.wl_push_subject, &ip, comment);
         return true;
     }
 
     if let Some(ip) = opt_matches.opt_str("wl-del-ip") {
-        modify_list(false, &nats, &config.ipset_white_list, &config.nats.wl_del_subject, &ip, None);
+        modify_list(&config.fw_type, false, &nats, &config.ipset_white_list, &config.nats.wl_del_subject, &ip, None);
         return true;
     }
 
     if let Some(ip) = opt_matches.opt_str("bl-add-ip") {
-        modify_list(true, &nats, &config.ipset_black_list, &config.nats.bl_push_subject, &ip, None);
+        modify_list(&config.fw_type, true, &nats, &config.ipset_black_list, &config.nats.bl_push_subject, &ip, None);
         let _ = kill_connection(&ip);
         return true;
     }
 
     if let Some(ip) = opt_matches.opt_str("bl-del-ip") {
-        modify_list(true, &nats, &config.ipset_black_list, &config.nats.bl_del_subject, &ip, None);
+        modify_list(&config.fw_type, true, &nats, &config.ipset_black_list, &config.nats.bl_del_subject, &ip, None);
         return true;
     }
 
@@ -244,10 +231,22 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
         let string = String::from_utf8(message.data).unwrap_or(String::default());
         let mut buf = String::new();
         for line in string.lines() {
-            buf.push_str(&format!("add {} {}\n", &config.ipset_white_list, line));
+            match config.fw_type {
+                FwType::IpTables => {
+                    // add diswall-wl 1.2.3.4 timeout 1234
+                    buf.push_str(&format!("add {} {}\n", &config.ipset_white_list, line));
+                }
+                FwType::NfTables => {
+                    // add element ip filter diswall-wl {1.2.3.4 timeout 1234s}
+                    buf.push_str(&format!("add element ip filter {} {{{}s}}\n", &config.ipset_white_list, line));
+                }
+            }
             trace!("To whitelist: {}", line);
         }
-        ipset::run_ipset("restore", "", &buf, None);
+        match config.fw_type {
+            FwType::IpTables => firewall::ipset_restore(&buf),
+            FwType::NfTables => firewall::nft_restore(&buf)
+        }
     }
 
     // Getting blocklist from server
@@ -255,25 +254,43 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
         let string = String::from_utf8(message.data).unwrap_or(String::default());
         let mut buf = String::new();
         for line in string.lines() {
-            buf.push_str(&format!("add {} {}\n", &config.ipset_black_list, line));
+            match config.fw_type {
+                FwType::IpTables => {
+                    // add diswall-bl 1.2.3.4 timeout 1234
+                    buf.push_str(&format!("add {} {}\n", &config.ipset_black_list, line));
+                }
+                FwType::NfTables => {
+                    // add element ip filter diswall-bl {1.2.3.4 timeout 1234s}
+                    buf.push_str(&format!("add element ip filter {} {{{}s}}\n", &config.ipset_black_list, line));
+                }
+            }
             trace!("To blacklist: {}", line);
         }
-        ipset::run_ipset("restore", "", &buf, None);
+        match config.fw_type {
+            FwType::IpTables => firewall::ipset_restore(&buf),
+            FwType::NfTables => firewall::nft_restore(&buf)
+        }
     }
 
     // Subscribe to new IPs for whitelist
     if let Ok(sub) = nats.subscribe(&config.nats.wl_subscribe_subject) {
         let list_name = config.ipset_white_list.clone();
+        let fw_type = config.fw_type.clone();
         sub.with_handler(move |message| {
             if let Ok(string) = String::from_utf8(message.data) {
                 let split = string.split("|").collect::<Vec<&str>>();
-                // If no comment
-                if split.len() == 1 {
-                    debug!("Got IP for whitelist: {}", split[0]);
-                    ipset::run_ipset("add", &list_name, split[0], None);
-                } else {
-                    debug!("Got IP for whitelist: {} ({})", split[0], split[1]);
-                    ipset::run_ipset("add", &list_name, split[0], Some(split[1].to_owned()));
+                match fw_type {
+                    FwType::IpTables => {
+                        // If no comment
+                        if split.len() == 1 {
+                            debug!("Got IP for whitelist: {}", split[0]);
+                            firewall::ipset_add_or_del("add", &list_name, split[0], None)
+                        } else {
+                            debug!("Got IP for whitelist: {} ({})", split[0], split[1]);
+                            firewall::ipset_add_or_del("add", &list_name, split[0], Some(split[1].to_owned()));
+                        }
+                    },
+                    FwType::NfTables => firewall::nft_add_or_del("add", &list_name, split[0])
                 }
             }
             Ok(())
@@ -284,6 +301,7 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
     // Subscribe for new IPs for blocklist
     if let Ok(sub) = nats.subscribe(&config.nats.bl_subscribe_subject) {
         let list_name = config.ipset_black_list.clone();
+        let fw_type = config.fw_type.clone();
         let cache = Arc::clone(&cache);
         sub.with_handler(move |message| {
             if let Ok(string) = String::from_utf8(message.data) {
@@ -302,7 +320,10 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
                     warn!("Too long tag '{}' from {}", &tag, &string);
                     return Ok(());
                 }
-                ipset::run_ipset("add", &list_name, &ip, None);
+                match fw_type {
+                    FwType::IpTables => firewall::ipset_add_or_del("add", &list_name, &ip, None),
+                    FwType::NfTables => firewall::nft_add_or_del("add", &list_name, &ip)
+                }
                 let _ = kill_connection(&ip);
                 if let Ok(mut cache) = cache.lock() {
                     cache.push(ip, true);
@@ -332,7 +353,7 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
                     Ok(timeout) => format!("{} timeout {}", &ip, timeout),
                     Err(_) => ip.clone()
                 };
-                ipset::run_ipset("add", &list_name, &data, None);
+                firewall::ipset_add_or_del("add", &list_name, &data, None);
                 let _ = kill_connection(&ip);
             }
             Ok(())
@@ -346,7 +367,7 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
         sub.with_handler(move |message| {
             if let Ok(string) = String::from_utf8(message.data) {
                 debug!("Got IP to delete from whitelist: {}", &string);
-                ipset::run_ipset("del", &list_name, &string, None);
+                firewall::ipset_add_or_del("del", &list_name, &string, None);
             }
             Ok(())
         });
@@ -359,7 +380,7 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
         sub.with_handler(move |message| {
             if let Ok(string) = String::from_utf8(message.data) {
                 debug!("Got IP to delete from blocklist: {}", &string);
-                ipset::run_ipset("del", &list_name, &string, None);
+                firewall::ipset_add_or_del("del", &list_name, &string, None);
             }
             Ok(())
         });
@@ -405,7 +426,7 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
             if let Ok(mut cache) = cache.lock() {
                 cache.push(ip.clone(), true);
             }
-            modify_list(true, &nats, &block_list, &config.nats.bl_push_subject, line.trim(), None);
+            modify_list(&config.fw_type, true, &nats, &block_list, &config.nats.bl_push_subject, line.trim(), None);
             let _ = kill_connection(&ip);
             let _ = banned_count.fetch_add(1u32, Ordering::SeqCst);
         } else {
@@ -415,7 +436,7 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
     }
 }
 
-fn modify_list(add: bool, nats: &Option<Connection>, list: &str, subject: &str, line: &str, comment: Option<String>) {
+fn modify_list(fw_type: &FwType, add: bool, nats: &Option<Connection>, list: &str, subject: &str, line: &str, comment: Option<String>) {
     let action = match add {
         true => "add",
         false => "del"
@@ -442,7 +463,10 @@ fn modify_list(add: bool, nats: &Option<Connection>, list: &str, subject: &str, 
                 if !ip.is_private() && !ip.is_loopback() && !ip.is_unspecified() {
                     debug!("{} {} to/from {}", action, line, list);
                     let ip = ip.to_string();
-                    ipset::run_ipset(action, &list, &ip, comment);
+                    match fw_type {
+                        FwType::IpTables => firewall::ipset_add_or_del(action, &list, &ip, comment),
+                        FwType::NfTables => firewall::nft_add_or_del(action, &list, &ip)
+                    }
                     if !tag.is_empty() {
                         push_to_nats(&nats, subject, format!("{}|{}", &ip, tag));
                     } else {
@@ -454,7 +478,10 @@ fn modify_list(add: bool, nats: &Option<Connection>, list: &str, subject: &str, 
                 if !ip.is_loopback() && !ip.is_unspecified() {
                     debug!("{} {} to/from {}", action, line, list);
                     let ip = ip.to_string();
-                    ipset::run_ipset(action, &list, &ip, comment);
+                    match fw_type {
+                        FwType::IpTables => firewall::ipset_add_or_del(action, &list, &ip, comment),
+                        FwType::NfTables => firewall::nft_add_or_del(action, &list, &ip)
+                    }
                     if !tag.is_empty() {
                         push_to_nats(&nats, subject, format!("{}|{}", &ip, tag));
                     } else {
