@@ -48,7 +48,6 @@ pub fn ipset_restore(data: &str) {
             error!("Error restoring ipset rules {}", e);
             return;
         }
-        let _ = command.wait();
     }
 }
 
@@ -56,12 +55,16 @@ pub fn ipset_restore(data: &str) {
 pub fn nft_add_or_del(action: &str, list_name: &str, data: &str) {
     let data = data.trim();
     let mut command = Command::new("nft");
-    command.args([action, "element", "ip", "filter", list_name, "{", data, "}"]);
+    let data = match data.contains("timeout") {
+        true => format!("{{{}s}}", data),
+        false => format!("{{{}}}", data)
+    };
+    command.args([action, "element", "ip", "filter", list_name, &data]);
     match command.stdout(Stdio::null()).spawn() {
         Err(e) => {
             match action {
-                "add" => error!("Error adding {} to ipset: {}", data, e),
-                "del" => error!("Error removing {} from ipset: {}", data, e),
+                "add" => error!("Error adding {} to nft set: {}", data, e),
+                "del" => error!("Error removing {} from nft set: {}", data, e),
                 &_ => error!("Error ipset command: {}", e)
             }
         }
@@ -84,7 +87,6 @@ pub fn nft_restore(data: &str) {
             error!("Error restoring ipset rules {}", e);
             return;
         }
-        let _ = command.wait();
     }
 }
 

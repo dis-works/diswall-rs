@@ -246,6 +246,7 @@ version = "0.2.0"
 dependencies = [
  "getopts",
  "hostname",
+ "json",
  "log",
  "lru",
  "nats",

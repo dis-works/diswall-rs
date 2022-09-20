@@ -1,5 +1,5 @@
 [Unit]
-Description=Diswall client mode firewall init service
+Description=Diswall client mode iptables init service
 After=network-online.target
 Wants=network-online.target
 

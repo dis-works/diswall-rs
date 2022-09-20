@@ -1,9 +1,9 @@
 [Unit]
 Description=Diswall client mode service
 After=network-online.target
-After=diswall-fw-init.service
+After=diswall-ipt-init.service
 Wants=network-online.target
-Wants=diswall-fw-init.service
+Wants=diswall-ipt-init.service
 
 [Service]
 ProtectHome=true

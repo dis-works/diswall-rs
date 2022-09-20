@@ -180,11 +180,16 @@ fn main() -> Result<(), i32> {
     if config.send_statistics {
         if let Some(nats) = nats.clone() {
             let banned_count = banned_count.clone();
-            let list_name = config.ipset_black_list.clone();
+            let black_list_name = config.ipset_black_list.clone();
+            let white_list_name = config.ipset_white_list.clone();
             let subject = config.nats.stats_subject.clone();
+            let fw_type = config.fw_type.clone();
             let prev_stats = Arc::new(RwLock::new(Stats::default()));
             let mut timer = HourlyTimer::new(move || {
-                collect_stats(&list_name, &subject, &nats, &banned_count, &prev_stats);
+                match fw_type {
+                    FwType::IpTables => collect_stats_from_iptables(&black_list_name, &subject, &nats, &banned_count, &prev_stats),
+                    FwType::NfTables => collect_stats_from_nftables(&black_list_name, &white_list_name, &subject, &nats, &banned_count, &prev_stats)
+                }
             });
             let _ = timer.start();
         }
@@ -202,24 +207,22 @@ fn process_ips_from_parameters(config: &Config, opt_matches: &Matches, nats: Opt
             None => None,
             Some(s) => Some(s)
         };
-        modify_list(&config.fw_type, true, &nats, &config.ipset_white_list, &config.nats.wl_push_subject, &ip, comment);
-        return true;
+        return modify_list(&config.fw_type, true, &nats, &config.ipset_white_list, &config.nats.wl_push_subject, &ip, comment);
     }
 
     if let Some(ip) = opt_matches.opt_str("wl-del-ip") {
-        modify_list(&config.fw_type, false, &nats, &config.ipset_white_list, &config.nats.wl_del_subject, &ip, None);
-        return true;
+        return modify_list(&config.fw_type, false, &nats, &config.ipset_white_list, &config.nats.wl_del_subject, &ip, None);
     }
 
     if let Some(ip) = opt_matches.opt_str("bl-add-ip") {
-        modify_list(&config.fw_type, true, &nats, &config.ipset_black_list, &config.nats.bl_push_subject, &ip, None);
-        let _ = kill_connection(&ip);
-        return true;
+        if modify_list(&config.fw_type, true, &nats, &config.ipset_black_list, &config.nats.bl_push_subject, &ip, None) {
+            let _ = kill_connection(&ip);
+            return true;
+        }
     }
 
     if let Some(ip) = opt_matches.opt_str("bl-del-ip") {
-        modify_list(&config.fw_type, true, &nats, &config.ipset_black_list, &config.nats.bl_del_subject, &ip, None);
-        return true;
+        return modify_list(&config.fw_type, true, &nats, &config.ipset_black_list, &config.nats.bl_del_subject, &ip, None);
     }
 
     false
@@ -337,6 +340,7 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
     // Subscribe for new IPs for blocklist
     if let Ok(sub) = nats.subscribe(&config.nats.bl_global_subject) {
         let list_name = config.ipset_black_list.clone();
+        let fw_type = config.fw_type.clone();
         sub.with_handler(move |message| {
             if let Ok(string) = String::from_utf8(message.data) {
                 //trace!("Got ip from global subject: {}", &string);
@@ -353,7 +357,10 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
                     Ok(timeout) => format!("{} timeout {}", &ip, timeout),
                     Err(_) => ip.clone()
                 };
-                firewall::ipset_add_or_del("add", &list_name, &data, None);
+                match fw_type {
+                    FwType::IpTables => firewall::ipset_add_or_del("add", &list_name, &data, None),
+                    FwType::NfTables => firewall::nft_add_or_del("add", &list_name, &data)
+                }
                 let _ = kill_connection(&ip);
             }
             Ok(())
@@ -403,10 +410,12 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
             let (ip, tag) = get_ip_and_tag(line.trim());
             if !valid_ip(&ip) {
                 warn!("Could not parse IP {} from {}", &ip, &line);
+                line.clear();
                 continue;
             }
             if tag.len() > 25 {
                 warn!("Too long tag '{}' from {}", &tag, &line);
+                line.clear();
                 continue;
             }
 
@@ -426,9 +435,10 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
             if let Ok(mut cache) = cache.lock() {
                 cache.push(ip.clone(), true);
             }
-            modify_list(&config.fw_type, true, &nats, &block_list, &config.nats.bl_push_subject, line.trim(), None);
-            let _ = kill_connection(&ip);
-            let _ = banned_count.fetch_add(1u32, Ordering::SeqCst);
+            if modify_list(&config.fw_type, true, &nats, &block_list, &config.nats.bl_push_subject, line.trim(), None) {
+                let _ = kill_connection(&ip);
+                let _ = banned_count.fetch_add(1u32, Ordering::SeqCst);
+            }
         } else {
             thread::sleep(delay);
         }
@@ -436,7 +446,7 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
     }
 }
 
-fn modify_list(fw_type: &FwType, add: bool, nats: &Option<Connection>, list: &str, subject: &str, line: &str, comment: Option<String>) {
+fn modify_list(fw_type: &FwType, add: bool, nats: &Option<Connection>, list: &str, subject: &str, line: &str, comment: Option<String>) -> bool {
     let action = match add {
         true => "add",
         false => "del"
@@ -450,13 +460,14 @@ fn modify_list(fw_type: &FwType, add: bool, nats: &Option<Connection>, list: &st
     };
     if !valid_ip(&ip) {
         warn!("Could not parse IP {} from {}", &ip, &line);
-        return;
+        return false;
     }
     if tag.len() > 25 {
         warn!("Too long tag '{}' from {}", &tag, &line);
-        return;
+        return false;
     }
 
+    let mut result = false;
     if let Ok(addr) = ip.parse::<IpAddr>() {
         match addr {
             IpAddr::V4(ip) => {
@@ -472,6 +483,7 @@ fn modify_list(fw_type: &FwType, add: bool, nats: &Option<Connection>, list: &st
                     } else {
                         push_to_nats(&nats, subject, ip);
                     }
+                    result = true;
                 }
             }
             IpAddr::V6(ip) => {
@@ -487,10 +499,12 @@ fn modify_list(fw_type: &FwType, add: bool, nats: &Option<Connection>, list: &st
                     } else {
                         push_to_nats(&nats, subject, ip);
                     }
+                    result = true;
                 }
             }
         }
     }
+    result
 }
 
 /// Publishes some IP to NATS server with particular subject
@@ -621,7 +635,7 @@ pub fn kill_connection(ip: &str) -> bool {
 }
 
 /// Collects statistics about dropped packets and dropped bytes from iptables
-fn collect_stats(list_name: &str, subject: &str, nats: &Connection, banned_count: &Arc<AtomicU32>, prev_stats: &RwLock<Stats>) {
+fn collect_stats_from_iptables(list_name: &str, subject: &str, nats: &Connection, banned_count: &Arc<AtomicU32>, prev_stats: &RwLock<Stats>) {
     let time = OffsetDateTime::now_utc().unix_timestamp();
     let command = Command::new("iptables")
         .arg("-nxvL")
@@ -659,6 +673,78 @@ fn collect_stats(list_name: &str, subject: &str, nats: &Connection, banned_count
                                     stats.packets_dropped = parts[0].parse::<u64>().unwrap_or(0u64);
                                     stats.bytes_dropped = parts[1].parse::<u64>().unwrap_or(0u64);
                                 }
+                            }
+                            let mut stats_to_push = stats.clone();
+                            {
+                                // But the second time we subtract previous stats, to make numbers for this hour only
+                                let prev = prev_stats.read().unwrap();
+                                stats_to_push.bytes_accepted -= prev.bytes_accepted;
+                                stats_to_push.bytes_dropped -= prev.bytes_dropped;
+                                stats_to_push.packets_accepted -= prev.packets_accepted;
+                                stats_to_push.packets_dropped -= prev.packets_dropped;
+                            }
+                            info!("Statistics: {:?}", &stats_to_push);
+                            let data = serde_json::to_string(&stats_to_push).unwrap_or(String::from("Error serializing stats"));
+                            // To distribute somehow requests to NATS server we make a random delay
+                            let delay = Duration::from_secs(rand::random::<u64>() % 60);
+                            thread::sleep(delay);
+                            if let Err(e) = nats.publish(subject, &data) {
+                                warn!("Could not send stats to NATS server: {}", e);
+                            }
+                            prev_stats.write().unwrap().copy_from(&stats);
+                        }
+                    }
+                },
+                Err(e) => error!("Error running iptables: {}", e)
+            }
+        }
+        Err(e) => error!("Error running iptables: {}", e)
+    }
+}
+
+/// Collects statistics about dropped packets and dropped bytes from iptables
+fn collect_stats_from_nftables(black_list_name: &str, white_list_name: &str, subject: &str, nats: &Connection, banned_count: &Arc<AtomicU32>, prev_stats: &RwLock<Stats>) {
+    let time = OffsetDateTime::now_utc().unix_timestamp();
+    let command = Command::new("nft")
+        .arg("-j")
+        .arg("list")
+        .arg("counters")
+        .stdout(Stdio::piped())
+        .spawn();
+    match command {
+        Ok(mut child) => {
+            match child.wait() {
+                Ok(status) => {
+                    if !status.success() {
+                        warn!("Could not get stats from iptables");
+                        return;
+                    }
+                    if let Some(mut out) = child.stdout.take() {
+                        let mut buf = String::new();
+                        if let Ok(_) = out.read_to_string(&mut buf) {
+                            let banned = banned_count.load(Ordering::SeqCst);
+                            // We clear banned count every hour
+                            banned_count.store(0u32, Ordering::SeqCst);
+                            let mut stats = Stats { time, banned, packets_dropped: 0, bytes_dropped: 0, packets_accepted: 0, bytes_accepted: 0 };
+                            match json::parse(&buf) {
+                                Ok(json) => {
+                                    for item in json["nftables"].members() {
+                                        for (name, value) in item.entries() {
+                                            if !name.eq("counter") {
+                                                continue;
+                                            }
+                                            if value["name"] == white_list_name {
+                                                stats.packets_accepted += value["packets"].as_u64().unwrap_or(0u64);
+                                                stats.bytes_accepted += value["bytes"].as_u64().unwrap_or(0u64);
+                                            }
+                                            if value["name"] == black_list_name {
+                                                stats.packets_dropped += value["packets"].as_u64().unwrap_or(0u64);
+                                                stats.bytes_dropped += value["bytes"].as_u64().unwrap_or(0u64);
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => error!("Error parsing stats from nft: {}", e)
                             }
                             let mut stats_to_push = stats.clone();
                             {

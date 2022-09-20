@@ -11,17 +11,19 @@ use serde::Deserialize;
 use log::{error, info, warn};
 #[cfg(not(windows))]
 use nix::unistd::mkfifo;
-use crate::utils;
+use crate::firewall::get_installed_fw_type;
+use crate::{FwType, utils};
 
 const RELEASE_URL: &str = "https://api.github.com/repos/dis-works/diswall-rs/releases/latest";
 
 const BIN_PATH: &str = "/usr/bin/diswall";
 const LOG_PATH: &str = "/etc/rsyslog.d/10-diswall.conf";
 const UNIT_PATH: &str = "/etc/systemd/system/diswall.service";
-const UNIT_FW_PATH: &str = "/etc/systemd/system/diswall-fw-init.service";
+const UNIT_IPT_INIT_PATH: &str = "/etc/systemd/system/diswall-fw-init.service";
 const PIPE_PATH: &str = "/var/log/diswall/diswall.pipe";
 const CONFIG_PATH: &str = "/etc/diswall/diswall.conf";
-const INIT_PATH: &str = "/usr/bin/diswall_init.sh";
+const IPT_INIT_PATH: &str = "/usr/bin/diswall_init.sh";
+const NFT_CONF_PATH: &str = "/etc/nftables.conf";
 
 const MAX_BIN_SIZE: usize = 10_000_000;
 
@@ -30,7 +32,14 @@ pub(crate) fn install_client() -> io::Result<()> {
     use std::fs;
     use nix::sys::stat;
     use std::path::Path;
-    use std::io::Write;
+
+    let fw_type = match get_installed_fw_type() {
+        Ok(fw_type) => fw_type,
+        Err(e) => {
+            error!("{}", e);
+            return Err(io::Error::from(io::ErrorKind::Other));
+        }
+    };
 
     // Configuring rsyslog
     if Path::new(LOG_PATH).exists() {
@@ -60,13 +69,6 @@ pub(crate) fn install_client() -> io::Result<()> {
         fs::write(UNIT_PATH, include_bytes!("../scripts/diswall.service"))?;
         info!("Created systemd service file: {}", UNIT_PATH);
     }
-    // Adding systemd service for firewall initialization
-    if Path::new(UNIT_FW_PATH).exists() {
-        info!("Not rewriting service file: {}", UNIT_FW_PATH);
-    } else {
-        fs::write(UNIT_FW_PATH, include_bytes!("../scripts/diswall-fw-init.service"))?;
-        info!("Created systemd service file: {}", UNIT_FW_PATH);
-    }
     // Creating rsyslog->diswall pipe
     if Path::new(PIPE_PATH).exists() {
         info!("Not rewriting pipe at: {}", PIPE_PATH);
@@ -90,8 +92,36 @@ pub(crate) fn install_client() -> io::Result<()> {
         fs::copy(exe_path, BIN_PATH)?;
     }
 
-    if Path::new(INIT_PATH).exists() {
-        info!("Not rewriting firewall init script: {}", INIT_PATH);
+    match fw_type {
+        FwType::IpTables => install_ipt_part()?,
+        FwType::NfTables => install_nft_part()?
+    }
+
+    info!("Installation complete!");
+    match fw_type {
+        FwType::IpTables => info!("Please, read and correct firewall init script at {}, it will run at system start.", IPT_INIT_PATH),
+        FwType::NfTables => info!("Please, read and correct firewall config at {}, it will run at system start.", NFT_CONF_PATH)
+    }
+    info!("Also, check DisWall config at {}, and enter client credentials.", CONFIG_PATH);
+    info!("And then you need to enable & start diswall service by running '(sudo) systemctl enable --now diswall.service'.");
+
+    Ok(())
+}
+
+fn install_ipt_part() -> io::Result<()> {
+    use std::fs;
+    use std::path::Path;
+    use std::io::Write;
+
+    // Adding systemd service for firewall initialization
+    if Path::new(UNIT_IPT_INIT_PATH).exists() {
+        info!("Not rewriting service file: {}", UNIT_IPT_INIT_PATH);
+    } else {
+        fs::write(UNIT_IPT_INIT_PATH, include_bytes!("../scripts/diswall-ipt-init.service"))?;
+        info!("Created systemd service file: {}", UNIT_IPT_INIT_PATH);
+    }
+    if Path::new(IPT_INIT_PATH).exists() {
+        info!("Not rewriting iptables init script: {}", IPT_INIT_PATH);
     } else {
         let services = get_listening_services();
         let mut buffer = String::new();
@@ -113,21 +143,140 @@ pub(crate) fn install_client() -> io::Result<()> {
             buffer.push_str(&s);
         }
 
-        let path = Path::new(INIT_PATH);
+        let path = Path::new(IPT_INIT_PATH);
         match File::create(&path) {
             Ok(mut f) => {
                 let script_content = include_str!("../scripts/diswall_init.sh").replace("#diswall_init_rules", &buffer);
-                f.write_all(script_content.as_bytes()).expect(&format!("Error saving script to {}", INIT_PATH));
+                f.write_all(script_content.as_bytes()).expect(&format!("Error saving script to {}", IPT_INIT_PATH));
                 set_permissions(&path, Permissions::from_mode(0o700))?;
             }
-            Err(e) => error!("Error saving script to {}: {}", INIT_PATH, e)
+            Err(e) => error!("Error saving script to {}: {}", IPT_INIT_PATH, e)
         }
     }
+    Ok(())
+}
 
-    info!("Installation complete!");
-    info!("Please, read and correct firewall init script at {}, it will run at system start.", INIT_PATH);
-    info!("Also, check DisWall config at {}, and enter client credentials.", CONFIG_PATH);
-    info!("And then you need to enable & start diswall service by running '(sudo) systemctl enable --now diswall.service'.");
+fn install_nft_part() -> io::Result<()> {
+    use std::path::Path;
+    use std::io::Write;
+
+    let current_config = match File::open(NFT_CONF_PATH) {
+        Ok(mut f) => {
+            let mut buf = String::new();
+            f.read_to_string(&mut buf)?;
+            buf
+        }
+        Err(_) => {
+            //TODO  check that it is problem with permissions
+            String::new()
+        }
+    };
+
+    let config_is_ours = current_config.contains("#diswall ruleset");
+    if !config_is_ours {
+        let mut buf = String::new();
+        // Commenting out all current config lines
+        for line in current_config.lines() {
+            if line.starts_with("#") {
+                buf.push_str(line);
+                buf.push('\n');
+            } else {
+                buf.push_str(&format!("#{}\n", &line));
+            }
+        }
+
+        // We allow current listening services to accept connections
+        let services = get_listening_services();
+        let mut lines = Vec::new();
+        for service in services {
+            if service.dst_addr.ip().is_loopback() {
+                continue;
+            }
+            let line = if service.src_addr.ip().is_unspecified() {
+                format!("    {} dport {} accept", &service.protocol, service.dst_addr.port())
+            } else if service.src_addr.ip().is_ipv4() {
+                // We work with IPv4 only for now
+                format!("    {} saddr {} dport {} accept", &service.protocol, &service.src_addr.ip(), service.dst_addr.port())
+            } else {
+                continue;
+            };
+            lines.push(line);
+        }
+        lines.sort();
+        lines.dedup();
+        let buffer = lines.join("\n");
+
+        let path = Path::new(NFT_CONF_PATH);
+        match File::create(&path) {
+            Ok(mut f) => {
+                let script_content = include_str!("../scripts/nftables.conf").replace("#diswall_init_rules", &buffer);
+                buf.push_str(&script_content);
+                f.write_all(buf.as_bytes()).expect(&format!("Error saving config to {}", NFT_CONF_PATH));
+                set_permissions(&path, Permissions::from_mode(0o755))?;
+            }
+            Err(e) => error!("Error saving config to {}: {}", NFT_CONF_PATH, e)
+        }
+    } else {
+        info!("Not rewriting nftables config: {}", NFT_CONF_PATH);
+    }
+    // Start or restart nftables service (It is installed but not enabled on Debian for some reason)
+    start_or_restart_nft()?;
+
+    Ok(())
+}
+
+fn start_or_restart_nft() -> io::Result<()> {
+    let mut need_restart = false;
+    match Command::new("systemctl")
+        .arg("status")
+        .arg("nftables")
+        .stdout(Stdio::piped()).spawn() {
+        Ok(mut child) => {
+            if let Ok(r) = child.wait() {
+                if r.success() {
+                    if let Some(mut stdout) = child.stdout.take() {
+                        let mut buf = String::new();
+                        let _ = stdout.read_to_string(&mut buf);
+                        if buf.contains("active (exited)") {
+                            need_restart = true;
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => return Err(e)
+    }
+
+    if need_restart {
+        match Command::new("systemctl")
+            .arg("restart")
+            .arg("nftables")
+            .stdout(Stdio::null()).spawn() {
+            Ok(mut child) => {
+                if let Ok(r) = child.wait() {
+                    if r.success() {
+                        info!("Nftables restarted successfully");
+                    }
+                }
+            }
+            Err(e) => return Err(e)
+        }
+    } else {
+        match Command::new("systemctl")
+            .arg("enable")
+            .arg("--now")
+            .arg("nftables")
+            .stdout(Stdio::null()).spawn() {
+            Ok(mut child) => {
+                if let Ok(r) = child.wait() {
+                    if r.success() {
+                        info!("Nftables enabled successfully");
+                    }
+                }
+            }
+            Err(e) => return Err(e)
+        }
+    }
 
     Ok(())
 }
@@ -247,9 +396,9 @@ pub(crate) fn uninstall_client() -> io::Result<()> {
     }
 
     let _ = fs::remove_file(UNIT_PATH);
-    let _ = fs::remove_file(UNIT_FW_PATH);
+    let _ = fs::remove_file(UNIT_IPT_INIT_PATH);
     let _ = fs::remove_file(CONFIG_PATH);
-    let _ = fs::remove_file(INIT_PATH);
+    let _ = fs::remove_file(IPT_INIT_PATH);
     let _ = fs::remove_file(PIPE_PATH);
     let _ = fs::remove_file(format!("{}.old", BIN_PATH));
     let _ = fs::remove_file(BIN_PATH);
