@@ -445,9 +445,9 @@ checksum = "e2abad23fbc42b3700f2f279844dc832adb2b2eb069b2df918f455c4e18cc646"
 
 [[package]]
 name = "libc"
-version = "0.2.125"
+version = "0.2.133"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5916d2ae698f6de9bfb891ad7a8d65c09d232dc58cc4ac433c7da3b2fd84bc2b"
+checksum = "c0f80d65747a3e43d1596c7c5492d95d5edddaabd45a7fcdb02b95f644164966"
 
 [[package]]
 name = "lock_api"
@@ -514,9 +514,9 @@ dependencies = [
 
 [[package]]
 name = "nats"
-version = "0.19.1"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2fa5d18c4246c056db53f826d3919fc93817dd850a7f2c4c211306218c82a9e"
+checksum = "3d61e51453596562c82656b4fb004071b5b0c214183be3d02fbb7b16ba2370df"
 dependencies = [
  "base64",
  "base64-url",
@@ -549,14 +549,16 @@ dependencies = [
 
 [[package]]
 name = "nix"
-version = "0.24.1"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f17df307904acd05aa8e32e97bb20f2a0df1728bbc2d771ae8f9a90463441e9"
+checksum = "e322c04a9e3440c327fca7b6c8a63e6890a32fa2ad689db972425f07e0d22abb"
 dependencies = [
+ "autocfg",
  "bitflags",
  "cfg-if",
  "libc",
  "memoffset",
+ "pin-utils",
 ]
 
 [[package]]
@@ -660,6 +662,12 @@ name = "pin-project-lite"
 version = "0.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e280fbe77cc62c91527259e9442153f4688736748d24660126286329742b4c6c"
+
+[[package]]
+name = "pin-utils"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "pkcs8"
@@ -1005,9 +1013,9 @@ dependencies = [
 
 [[package]]
 name = "sqlite"
-version = "0.26.0"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fb1a534c07ec276fbbe0e55a1c00814d8563da3a2f4d9d9d4c802bd1278db6a"
+checksum = "e2df8edd55685048550daaaf2be9024182f3523086cc86f7d50c136e55173e8c"
 dependencies = [
  "libc",
  "sqlite3-sys",
@@ -1015,9 +1023,9 @@ dependencies = [
 
 [[package]]
 name = "sqlite3-src"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a260b07ce75a0644c6f5891f34f46db9869e731838e95293469ab17999abcfa3"
+checksum = "d1815a7a02c996eb8e5c64f61fcb6fd9b12e593ce265c512c5853b2513635691"
 dependencies = [
  "cc",
  "pkg-config",
@@ -1025,9 +1033,9 @@ dependencies = [
 
 [[package]]
 name = "sqlite3-sys"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04d2f028faeb14352df7934b4771806f60d61ce61be1928ec92396d7492e2e54"
+checksum = "d47c99824fc55360ba00caf28de0b8a0458369b832e016a64c13af0ad9fbb9ee"
 dependencies = [
  "libc",
  "sqlite3-src",

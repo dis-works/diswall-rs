@@ -329,10 +329,11 @@ fn get_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: bo
     };
     match db.prepare(GET_LIST) {
         Ok(mut statement) => {
-            statement.bind(1, client).expect("Error in bind");
-            statement.bind(2, hostname).expect("Error in bind");
-            statement.bind(3, blacklist).expect("Error in bind");
-            statement.bind(4, now).expect("Error in bind");
+            statement = statement
+                .bind(1, client).expect("Error in bind")
+                .bind(2, hostname).expect("Error in bind")
+                .bind(3, blacklist).expect("Error in bind")
+                .bind(4, now).expect("Error in bind");
             while statement.next().unwrap() == State::Row {
                 if let Ok(mut string) = statement.read::<String>(0) {
                     let until = statement.read::<i64>(1).unwrap_or(0);
@@ -360,9 +361,10 @@ fn add_to_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist:
             return DEFAULT_TIMEOUT;
         }
     };
-    statement.bind(1, client).expect("Error in bind");
-    statement.bind(2, blacklist as i64).expect("Error in bind");
-    statement.bind(3, ip).expect("Error in bind");
+    statement = statement
+        .bind(1, client).expect("Error in bind")
+        .bind(2, blacklist as i64).expect("Error in bind")
+        .bind(3, ip).expect("Error in bind");
     let count = match statement.next().unwrap() {
         State::Row => match statement.read::<i64>(0) {
             Ok(count) => count,
@@ -386,24 +388,26 @@ fn add_to_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist:
     let until = time + timeout;
     if count > 0 {
         trace!("Updating {} ban time", &ip);
-        let mut statement = db.prepare(UPDATE_IN_LIST).expect("Error in prepare");
-        statement.bind(1, count + 1).expect("Error in bind");
-        statement.bind(2, until).expect("Error in bind");
-        statement.bind(3, client).expect("Error in bind");
-        statement.bind(4, blacklist as i64).expect("Error in bind");
-        statement.bind(5, ip).expect("Error in bind");
+        let mut statement = db.prepare(UPDATE_IN_LIST)
+            .expect("Error in prepare")
+            .bind(1, count + 1).expect("Error in bind")
+            .bind(2, until).expect("Error in bind")
+            .bind(3, client).expect("Error in bind")
+            .bind(4, blacklist as i64).expect("Error in bind")
+            .bind(5, ip).expect("Error in bind");
         if let Err(e) = statement.next() {
             warn!("Error adding to DB: {}", e);
         }
     } else {
         // If we have no record of this IP we add it now
         trace!("Adding {} to list", &ip);
-        let mut statement = db.prepare(ADD_TO_LIST).expect("Error in prepare");
-        statement.bind(1, client).expect("Error in bind");
-        statement.bind(2, hostname).expect("Error in bind");
-        statement.bind(3, blacklist as i64).expect("Error in bind");
-        statement.bind(4, ip).expect("Error in bind");
-        statement.bind(5, until).expect("Error in bind");
+        let mut statement = db.prepare(ADD_TO_LIST)
+            .expect("Error in prepare")
+            .bind(1, client).expect("Error in bind")
+            .bind(2, hostname).expect("Error in bind")
+            .bind(3, blacklist as i64).expect("Error in bind")
+            .bind(4, ip).expect("Error in bind")
+            .bind(5, until).expect("Error in bind");
         if let Err(e) = statement.next() {
             warn!("Error adding to DB: {}", e);
         }
@@ -412,12 +416,12 @@ fn add_to_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist:
 }
 
 fn delete_from_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: bool, ip: &str) -> sqlite::Result<State> {
-    let mut statement = db.prepare(DELETE_FROM_LIST)?;
-    statement.bind(1, client)?;
-    statement.bind(2, hostname)?;
-    statement.bind(3, blacklist as i64)?;
-    statement.bind(4, ip)?;
-    statement.next()
+    db.prepare(DELETE_FROM_LIST)?
+        .bind(1, client)?
+        .bind(2, hostname)?
+        .bind(3, blacklist as i64)?
+        .bind(4, ip)?
+        .next()
 }
 
 fn count_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: bool) -> i64 {
@@ -428,10 +432,11 @@ fn count_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: 
     };
     match db.prepare(COUNT_LIST) {
         Ok(mut statement) => {
-            statement.bind(1, client).expect("Error in bind");
-            statement.bind(2, hostname).expect("Error in bind");
-            statement.bind(3, blacklist).expect("Error in bind");
-            statement.bind(4, until).expect("Error in bind");
+            statement = statement
+                .bind(1, client).expect("Error in bind")
+                .bind(2, hostname).expect("Error in bind")
+                .bind(3, blacklist).expect("Error in bind")
+                .bind(4, until).expect("Error in bind");
             while statement.next().unwrap() == State::Row {
                 if let Ok(count) = statement.read::<i64>(0) {
                     return count;
