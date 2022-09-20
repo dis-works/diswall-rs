@@ -379,7 +379,8 @@ fn add_to_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist:
                 0 => 900,
                 1 => 1800,
                 2 => 3600,
-                _ => 3600 * count
+                3..=7 => 3600 * (count - 1),
+                _ => 6 * 3600 * (count - 1)
             }
         }
         Some(timeout) => timeout
