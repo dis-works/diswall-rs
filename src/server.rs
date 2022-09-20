@@ -147,7 +147,7 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
                     // We push tag only from honeypots
                     tag.clear();
                 }
-                let request = format!("INSERT INTO scanners VALUES ({}, {}, '{}', '{}')", &client_mix, time, &ip, &tag);
+                let request = format!("INSERT INTO scanners VALUES ({}, {}, {}, '{}', '{}')", &client_mix, time, time + timeout, &ip, &tag);
                 send_clickhouse_request(&agent, &config, &request);
                 let request = format!("INSERT INTO nats_data (client, hostname, blacklist, ip, until) VALUES ('{}', '{}', {}, '{}', {})", &client, &hostname, 1, &ip, time + timeout);
                 send_clickhouse_request(&agent, &config, &request);
