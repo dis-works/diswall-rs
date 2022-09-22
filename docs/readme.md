@@ -2,7 +2,7 @@
 
 <!-- TOC -->
 * [How it works](#how-it-works)
-   * [Simplified iptables+ipset configuration](#simplified-iptablesipset-configuration)
+   * [Simplified firewall configuration](#simplified-firewall-configuration)
    * [Distributed part](#distributed-part)
 * [Getting started](#getting-started)
    * [Dependencies](#dependencies)
@@ -16,22 +16,32 @@
 
 ## How it works
 
-Main functionality - the IPs blocking mechanism, works with help of iptables and ipset. You need to install them on your server before you begin.
-What is iptables? It is a firewall that can check all network packets for some criteria and to do some actions with them.
-What is ipset? It is an extension to iptables, that adds an ability to work with big lists of networks or IPs.
-So, iptables can check any packet against a big list and do something if some IP belongs to the list or not.
+DisWall is an extension for your firewall. It supports `nftables` and `iptables`. For the latter it needs `ipset` to be installed too.
+The main functionality is monitoring of attempts to scan inactive ports on your server and ban such IPs.
+But if you use it in *distributed* mode, then you have an active list of scanning IPs from our honeypots.
 
-### Simplified iptables+ipset configuration
+We have a bunch of honeypots that are constantly banning such IPs and a server to maintain a database.
+Now the banning intervals are variable - we ban for 15 minutes the first time, then 30 minutes, then an hour * scan attempts.
+There are IPs that are banned for several months already.
 
-`iptables` is configured to allow local and established connections as well as connections from explicitly defined IPs and/or networks.
-Then, it is configured to block anything that is added to an ipset list `diswall-bl`.
-After that it allows connections to explicitly defined ports (services).
-And (the remainder) if some connection (or UDP datagram) is trying to get to some other port it is logged to syslog with well-defined tag.
-After that rsyslog takes only source IP from that logged packet and writes it to a pipe (`/var/log/diswall/diswall/pipe`), and DisWall reads it and blocks it by adding it to ipset list.
+So, how does it work?
+
+Essentially, there are three parts of working DisWall:
+1. Correctly configured firewall (`iptables` or `nftables`)
+2. Logging facility (done by additional config of `rsyslog`)
+3. DisWall service that is reading IPs from a logging pipe
+
+### Simplified firewall configuration
+
+`iptables` or `nftables` is configured to allow local and established connections as well as connections from explicitly defined IPs and/or networks.
+In case of `iptables` it is done in `/usr/bin/diswall_init.sh` and this script is run by a service `diswall-ipt-init`,
+but in case of `nftables` it is done in `/etc/nftables.conf` and is run by `nftables` service itself.
+
+In simple terms, there are two lists/sets to allow connections (`diswall-wl`) and to block connections (`diswall-bl`).
+
+If some packet is not explicitly allowed then it is logged, and rsyslog takes only source IP from that logged packet
+and writes it to a pipe (`/var/log/diswall/diswall/pipe`), and then DisWall reads it and blocks it by adding it to ipset list or nftables set.
 Rsyslog is configured by a config file `/etc/rsyslog.d/10-diswall.conf`, it is added to your system during installation.
-
-Full configuration is done in `/usr/bin/diswall_init.sh`, and you MUST check this file after diswall installation.
-This file is run by a service `diswall-fw-init` before starting of `diswall` service itself.
 
 ### Distributed part
 
@@ -46,18 +56,19 @@ Your local diswall will constantly get new IPs to block on a constant basis. If 
 ### Dependencies
 
 First of all you will need some dependencies to be installed.
-1. Install iptables and ipset (`sudo apt install iptables ipset`). And if you have some other firewall (`ufw` or `firewalld`) uninstall it.
-2. If you want to use quick-install script from our site - make sure you have jq installed (`sudo install jq`).
+1. If you want to use iptables, then install iptables and ipset (`sudo apt install iptables ipset`). If you have nftables installed (like in fresh Debian 11), then you don't have to install firewall. And if you have some other firewall (`ufw` or `firewalld`) uninstall it.
+2. If you want to use quick-install script from our site - make sure you have jq installed (`sudo apt install jq`).
 
 ### Installation
 
-Use `curl https://get.diswall.stream | bash` or `wget -O - https://get.diswall.stream | bash` to install the DisWall.
+Use `curl https://get.diswall.stream | bash` or `wget -q -O - https://get.diswall.stream | bash` to install the DisWall.
 
 ### Configuration
 
-1. If you want to use full-fledged DisWall then you need to register on [diswall.stream](https://diswall.stream), confirm e-mail and copy credentials from our mail to `/etc/diswall/diswall.conf`.
+1. If you want to use full-fledged DisWall then you need to register on [diswall.stream](https://diswall.stream), confirm e-mail address and copy credentials from our mail to `/etc/diswall/diswall.conf`.
 
-2. This step maybe is most important. Open `/usr/bin/diswall_init.sh` with your preferred text editor and check all autogenerated rules for iptables that are in this file.
+2. This step maybe is most important. Open `/usr/bin/diswall_init.sh` (if you use iptables) with your preferred text editor and check all autogenerated rules for iptables that are in this file.
+   If you use nftables, then open `/etc/nftables.conf` and check that configuration is correct.
    You can add some other rules to allow all connections from your home or office IPs no matter what to be sure that if something goes wrong you can connect to your server via SSH and correct things.
 
 Only after these steps you can enable and start diswall service (`sudo systemctl enable --now diswall`).
