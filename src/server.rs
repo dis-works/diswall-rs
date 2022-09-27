@@ -124,7 +124,12 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
                     warn!("Too long tag '{}' from {}", &tag, &client);
                     return Ok(());
                 }
-                info!("Got IP {} with tag '{}'", &ip, &tag);
+                if tag.is_empty() {
+                    info!("Got IP {} from {}/{}", &ip, &client, &hostname);
+                } else {
+                    info!("Got IP {} with tag '{}' from {}/{}", &ip, &tag, &client, &hostname);
+                }
+
                 let time = OffsetDateTime::now_utc().unix_timestamp();
                 let client_mix = mix_client(format!("{}/{}/{}", &client, &hostname, &config.clickhouse.salt).as_bytes());
                 // If this IP was sent by one of our honeypots we add this IP without client and hostname
