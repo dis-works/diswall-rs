@@ -3,6 +3,7 @@ use std::{env, io, thread};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::net::IpAddr;
+use std::num::NonZeroUsize;
 use std::process::{Command, exit, Stdio};
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -18,11 +19,12 @@ use crate::server::run_server;
 use crate::install::{install_client, update_client};
 use crate::timer::HourlyTimer;
 use crate::types::Stats;
-use crate::utils::{get_ip_and_tag, reduce_spaces};
+use crate::utils::{get_first_part, get_ip_and_tag, is_ipv6, reduce_spaces};
 use lru::LruCache;
 use utils::valid_ip;
 #[cfg(not(windows))]
 use crate::install::uninstall_client;
+use crate::install::update_fw_configs_for_ipv6;
 
 mod config;
 mod firewall;
@@ -75,6 +77,7 @@ fn main() -> Result<(), i32> {
     // Override config options by options from arguments
     config.override_config_from_args(&opt_matches);
     config.init_nats_subjects();
+    setup_logger(&opt_matches);
     match firewall::get_installed_fw_type() {
         Ok(t) => config.fw_type = t,
         Err(e) => {
@@ -82,7 +85,28 @@ fn main() -> Result<(), i32> {
             return Err(100);
         }
     }
-    setup_logger(&opt_matches);
+
+    // If we have old configs we update them
+    if !update_fw_configs_for_ipv6() {
+        warn!("Error updating config for IPv6 support. Please, run `sudo diswall` one time to enable IPv6 support.");
+        return Ok(());
+    }
+
+    if opt_matches.opt_present("upgrade-ipv6") {
+        // We did the upgrade 2 lines before
+        // Restarting service
+        match Command::new("systemctl").arg("restart").arg("diswall").stdout(Stdio::null()).spawn() {
+            Ok(mut child) => {
+                if let Ok(r) = child.wait() {
+                    if r.success() {
+                        info!("Updated successfully, service restarted");
+                        return Ok(());
+                    }
+                }
+            }
+            Err(_) => ()
+        }
+    }
 
     if opt_matches.opt_present("install") {
         #[cfg(windows)]
@@ -136,7 +160,7 @@ fn main() -> Result<(), i32> {
     }
 
     debug!("Loaded config:\n{:#?}", &config);
-    let cache = Arc::new(Mutex::new(LruCache::new(8)));
+    let cache = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(8).unwrap())));
 
     let nats = if !config.local_only && !config.nats.server.is_empty() {
         //let hostname = config::get_hostname();
@@ -230,49 +254,65 @@ fn process_ips_from_parameters(config: &Config, opt_matches: &Matches, nats: Opt
 
 fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<LruCache<String, bool>>>) {
     let msg = String::new();
-    if let Ok(message) = nats.request(&config.nats.wl_init_subject, &msg) {
-        let string = String::from_utf8(message.data).unwrap_or(String::default());
-        let mut buf = String::new();
-        for line in string.lines() {
-            match config.fw_type {
-                FwType::IpTables => {
-                    // add diswall-wl 1.2.3.4 timeout 1234
-                    buf.push_str(&format!("add {} {}\n", &config.ipset_white_list, line));
+    match nats.request(&config.nats.wl_init_subject, &msg) {
+        Ok(message) => {
+            let string = String::from_utf8(message.data).unwrap_or(String::default());
+            let mut buf = String::new();
+            for line in string.lines() {
+                let ip = get_first_part(line);
+                let suffix = match is_ipv6(&ip) {
+                    true => "6",
+                    false => ""
+                };
+                match config.fw_type {
+                    FwType::IpTables => {
+                        // add diswall-wl 1.2.3.4 timeout 1234
+                        buf.push_str(&format!("add {}{} {}\n", &config.ipset_white_list, suffix, line));
+                    }
+                    FwType::NfTables => {
+                        // add element ip filter diswall-wl {1.2.3.4 timeout 1234s}
+                        buf.push_str(&format!("add element ip filter {}{} {{{}s}}\n", &config.ipset_white_list, suffix, line));
+                    }
                 }
-                FwType::NfTables => {
-                    // add element ip filter diswall-wl {1.2.3.4 timeout 1234s}
-                    buf.push_str(&format!("add element ip filter {} {{{}s}}\n", &config.ipset_white_list, line));
-                }
+                trace!("To whitelist: {}", line);
             }
-            trace!("To whitelist: {}", line);
+            match config.fw_type {
+                FwType::IpTables => firewall::ipset_restore(&buf),
+                FwType::NfTables => firewall::nft_restore(&buf)
+            }
         }
-        match config.fw_type {
-            FwType::IpTables => firewall::ipset_restore(&buf),
-            FwType::NfTables => firewall::nft_restore(&buf)
-        }
+        Err(e) => error!("Error requesting WL from NATS server: {}", e)
     }
 
     // Getting blocklist from server
-    if let Ok(message) = nats.request(&config.nats.bl_init_subject, &msg) {
-        let string = String::from_utf8(message.data).unwrap_or(String::default());
-        let mut buf = String::new();
-        for line in string.lines() {
-            match config.fw_type {
-                FwType::IpTables => {
-                    // add diswall-bl 1.2.3.4 timeout 1234
-                    buf.push_str(&format!("add {} {}\n", &config.ipset_black_list, line));
+    match nats.request(&config.nats.bl_init_subject, &msg) {
+        Ok(message) => {
+            let string = String::from_utf8(message.data).unwrap_or(String::default());
+            let mut buf = String::new();
+            for line in string.lines() {
+                let ip = get_first_part(line);
+                let suffix = match is_ipv6(&ip) {
+                    true => "6",
+                    false => ""
+                };
+                match config.fw_type {
+                    FwType::IpTables => {
+                        // add diswall-bl 1.2.3.4 timeout 1234
+                        buf.push_str(&format!("add {}{} {}\n", &config.ipset_black_list, suffix, line));
+                    }
+                    FwType::NfTables => {
+                        // add element ip filter diswall-bl {1.2.3.4 timeout 1234s}
+                        buf.push_str(&format!("add element ip filter {}{} {{{}s}}\n", &config.ipset_black_list, suffix, line));
+                    }
                 }
-                FwType::NfTables => {
-                    // add element ip filter diswall-bl {1.2.3.4 timeout 1234s}
-                    buf.push_str(&format!("add element ip filter {} {{{}s}}\n", &config.ipset_black_list, line));
-                }
+                trace!("To blacklist: {}", line);
             }
-            trace!("To blacklist: {}", line);
+            match config.fw_type {
+                FwType::IpTables => firewall::ipset_restore(&buf),
+                FwType::NfTables => firewall::nft_restore(&buf)
+            }
         }
-        match config.fw_type {
-            FwType::IpTables => firewall::ipset_restore(&buf),
-            FwType::NfTables => firewall::nft_restore(&buf)
-        }
+        Err(e) => error!("Error requesting BL from NATS server: {}", e)
     }
 
     // Subscribe to new IPs for whitelist
@@ -282,18 +322,22 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
         sub.with_handler(move |message| {
             if let Ok(string) = String::from_utf8(message.data) {
                 let split = string.split("|").collect::<Vec<&str>>();
+                let list = match is_ipv6(split[0]) {
+                    true => format!("{}6", list_name),
+                    false => list_name.to_owned()
+                };
                 match fw_type {
                     FwType::IpTables => {
                         // If no comment
                         if split.len() == 1 {
                             debug!("Got IP for whitelist: {}", split[0]);
-                            firewall::ipset_add_or_del("add", &list_name, split[0], None)
+                            firewall::ipset_add_or_del("add", &list, split[0], None)
                         } else {
                             debug!("Got IP for whitelist: {} ({})", split[0], split[1]);
-                            firewall::ipset_add_or_del("add", &list_name, split[0], Some(split[1].to_owned()));
+                            firewall::ipset_add_or_del("add", &list, split[0], Some(split[1].to_owned()));
                         }
                     },
-                    FwType::NfTables => firewall::nft_add_or_del("add", &list_name, split[0])
+                    FwType::NfTables => firewall::nft_add_or_del("add", &list, split[0])
                 }
             }
             Ok(())
@@ -302,39 +346,46 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
     }
 
     // Subscribe for new IPs for blocklist
-    if let Ok(sub) = nats.subscribe(&config.nats.bl_subscribe_subject) {
-        let list_name = config.ipset_black_list.clone();
-        let fw_type = config.fw_type.clone();
-        let cache = Arc::clone(&cache);
-        sub.with_handler(move |message| {
-            if let Ok(string) = String::from_utf8(message.data) {
-                //trace!("Got ip from my subject: {}", &string);
-                let (ip, tag) = get_ip_and_tag(&string);
-                if !valid_ip(&ip) {
-                    warn!("Could not parse IP {} from {}", &ip, &string);
-                    return Ok(());
-                }
-                if let Ok(cache) = cache.lock() {
-                    if cache.contains(&ip) {
+    match nats.subscribe(&config.nats.bl_subscribe_subject) {
+        Ok(sub) => {
+            let list_name = config.ipset_black_list.clone();
+            let fw_type = config.fw_type.clone();
+            let cache = Arc::clone(&cache);
+            sub.with_handler(move |message| {
+                if let Ok(string) = String::from_utf8(message.data) {
+                    //trace!("Got ip from my subject: {}", &string);
+                    let (ip, tag) = get_ip_and_tag(&string);
+                    if !valid_ip(&ip) {
+                        warn!("Could not parse IP {} from {}", &ip, &string);
                         return Ok(());
                     }
+                    if let Ok(cache) = cache.lock() {
+                        if cache.contains(&ip) {
+                            return Ok(());
+                        }
+                    }
+                    if tag.len() > 25 {
+                        warn!("Too long tag '{}' from {}", &tag, &string);
+                        return Ok(());
+                    }
+                    let list = match is_ipv6(&ip) {
+                        true => format!("{}6", list_name),
+                        false => list_name.to_owned()
+                    };
+                    match fw_type {
+                        FwType::IpTables => firewall::ipset_add_or_del("add", &list, &ip, None),
+                        FwType::NfTables => firewall::nft_add_or_del("add", &list, &ip)
+                    }
+                    let _ = kill_connection(&ip);
+                    if let Ok(mut cache) = cache.lock() {
+                        cache.push(ip, true);
+                    }
                 }
-                if tag.len() > 25 {
-                    warn!("Too long tag '{}' from {}", &tag, &string);
-                    return Ok(());
-                }
-                match fw_type {
-                    FwType::IpTables => firewall::ipset_add_or_del("add", &list_name, &ip, None),
-                    FwType::NfTables => firewall::nft_add_or_del("add", &list_name, &ip)
-                }
-                let _ = kill_connection(&ip);
-                if let Ok(mut cache) = cache.lock() {
-                    cache.push(ip, true);
-                }
-            }
-            Ok(())
-        });
-        info!("Subscribed to {}", &config.nats.bl_subscribe_subject);
+                Ok(())
+            });
+            info!("Subscribed to {}", &config.nats.bl_subscribe_subject);
+        }
+        Err(e) => error!("Error subscribing to BL updates from NATS server: {}", e)
     }
 
     // Subscribe for new IPs for blocklist
@@ -357,9 +408,13 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
                     Ok(timeout) => format!("{} timeout {}", &ip, timeout),
                     Err(_) => ip.clone()
                 };
+                let list = match is_ipv6(&ip) {
+                    true => format!("{}6", list_name),
+                    false => list_name.to_owned()
+                };
                 match fw_type {
-                    FwType::IpTables => firewall::ipset_add_or_del("add", &list_name, &data, None),
-                    FwType::NfTables => firewall::nft_add_or_del("add", &list_name, &data)
+                    FwType::IpTables => firewall::ipset_add_or_del("add", &list, &data, None),
+                    FwType::NfTables => firewall::nft_add_or_del("add", &list, &data)
                 }
                 let _ = kill_connection(&ip);
             }
@@ -403,46 +458,48 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
     debug!("Pipe opened, waiting for IPs");
     let block_list = config.ipset_black_list.as_str();
     let mut line = String::new();
-    let delay = Duration::from_millis(5);
+    let delay = Duration::from_millis(2);
     loop {
         let len = reader.read_line(&mut line)?;
         if len > 0 {
-            let (ip, tag) = get_ip_and_tag(line.trim());
-            if !valid_ip(&ip) {
-                warn!("Could not parse IP {} from {}", &ip, &line);
-                line.clear();
-                continue;
-            }
-            if tag.len() > 25 {
-                warn!("Too long tag '{}' from {}", &tag, &line);
-                line.clear();
-                continue;
-            }
-
-            if let Ok(cache) = cache.lock() {
-                if cache.contains(&ip) {
-                    debug!("Already banned {}", &ip);
-                    line.clear();
-                    continue;
-                }
-            }
-            if !tag.is_empty() {
-                debug!("Got new IP: {} with tag '{}'", &ip, &tag);
-            } else {
-                debug!("Got new IP: {}", &ip);
-            }
-            // We push this IP to cache before we push it to NATS to avoid duplication
-            if let Ok(mut cache) = cache.lock() {
-                cache.push(ip.clone(), true);
-            }
-            if modify_list(&config.fw_type, true, &nats, &block_list, &config.nats.bl_push_subject, line.trim(), None) {
-                let _ = kill_connection(&ip);
-                let _ = banned_count.fetch_add(1u32, Ordering::SeqCst);
-            }
+            process_ip(&config, &nats, banned_count, &cache, &block_list, &line);
         } else {
             thread::sleep(delay);
         }
         line.clear();
+    }
+}
+
+fn process_ip(config: &Config, nats: &Option<Connection>, banned_count: &Arc<AtomicU32>, cache: &Arc<Mutex<LruCache<String, bool>>>, block_list: &str, line: &str) {
+    let (ip, tag) = get_ip_and_tag(line.trim());
+    if !valid_ip(&ip) {
+        warn!("Could not parse IP {} from {}", &ip, &line);
+        return;
+    }
+    if tag.len() > 25 {
+        warn!("Too long tag '{}' from {}", &tag, &line);
+        return;
+    }
+
+    if let Ok(cache) = cache.lock() {
+        if cache.contains(&ip) {
+            debug!("Already banned {}", &ip);
+            return;
+        }
+    }
+    if !tag.is_empty() {
+        debug!("Got new IP: {} with tag '{}'", &ip, &tag);
+    } else {
+        debug!("Got new IP: {}", &ip);
+    }
+
+    if modify_list(&config.fw_type, true, &nats, &block_list, &config.nats.bl_push_subject, line.trim(), None) {
+        let _ = kill_connection(&ip);
+        let _ = banned_count.fetch_add(1u32, Ordering::SeqCst);
+        // We push this IP to cache before we push it to NATS to avoid duplication
+        if let Ok(mut cache) = cache.lock() {
+            cache.push(ip.clone(), true);
+        }
     }
 }
 
@@ -466,6 +523,10 @@ fn modify_list(fw_type: &FwType, add: bool, nats: &Option<Connection>, list: &st
         warn!("Too long tag '{}' from {}", &tag, &line);
         return false;
     }
+    let list = match is_ipv6(&ip) {
+        true => format!("{}6", list),
+        false => list.to_owned()
+    };
 
     let mut result = false;
     if let Ok(addr) = ip.parse::<IpAddr>() {
@@ -476,7 +537,10 @@ fn modify_list(fw_type: &FwType, add: bool, nats: &Option<Connection>, list: &st
                     let ip = ip.to_string();
                     match fw_type {
                         FwType::IpTables => firewall::ipset_add_or_del(action, &list, &ip, comment),
-                        FwType::NfTables => firewall::nft_add_or_del(action, &list, &ip)
+                        FwType::NfTables => {
+                            firewall::nft_add_or_del("delete", &list, &ip);
+                            firewall::nft_add_or_del(action, &list, &ip);
+                        }
                     }
                     if !tag.is_empty() {
                         push_to_nats(&nats, subject, format!("{}|{}", &ip, tag));
@@ -492,7 +556,10 @@ fn modify_list(fw_type: &FwType, add: bool, nats: &Option<Connection>, list: &st
                     let ip = ip.to_string();
                     match fw_type {
                         FwType::IpTables => firewall::ipset_add_or_del(action, &list, &ip, comment),
-                        FwType::NfTables => firewall::nft_add_or_del(action, &list, &ip)
+                        FwType::NfTables => {
+                            firewall::nft_add_or_del("delete", &list, &ip);
+                            firewall::nft_add_or_del(action, &list, &ip);
+                        }
                     }
                     if !tag.is_empty() {
                         push_to_nats(&nats, subject, format!("{}|{}", &ip, tag));
@@ -524,6 +591,7 @@ fn get_options(args: &Vec<String>) -> (Options, Matches) {
     opts.optflag("v", "version", "Print version and exit");
     opts.optflag("", "install", "Install DisWall as system service (in client mode)");
     opts.optflag("", "update", "Update DisWall to latest release from GitHub");
+    opts.optflag("", "upgrade-ipv6", "Update DisWall to latest release from GitHub");
     opts.optflag("", "uninstall", "Uninstall DisWall from your server");
     opts.optflag("d", "debug", "Show trace messages, more than debug");
     opts.optflag("g", "generate", "Generate fresh configuration file. It is better to redirect contents to file.");
@@ -615,9 +683,15 @@ pub fn kill_connection(ip: &str) -> bool {
         error!("Can not parse IP address from {}", ip);
         return false;
     }
+    let ip = match is_ipv6(ip) {
+        true => format!("[{}]", ip),
+        false => ip.to_owned()
+    };
 
     let command = Command::new("ss")
-        .arg("-K")
+        .arg("--no-header")
+        .arg("--numeric")
+        .arg("--kill")
         .arg("dst")
         .arg(ip)
         .stdout(Stdio::null())

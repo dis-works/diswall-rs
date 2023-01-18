@@ -11,7 +11,7 @@ use time::OffsetDateTime;
 use ureq::Agent;
 use crate::{Config, Stats, utils};
 use crate::config::{PREFIX_BL, PREFIX_STATS, PREFIX_WL};
-use crate::utils::get_ip_and_tag;
+use crate::utils::{get_ip_and_tag, is_ipv6};
 
 pub const DB_NAME: &str = "diswall.db";
 pub const CREATE_DB: &str = include_str!("../data/create_db.sql");
@@ -152,9 +152,14 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
                     // We push tag only from honeypots
                     tag.clear();
                 }
-                let request = format!("INSERT INTO scanners VALUES ({}, {}, {}, '{}', '{}')", &client_mix, time, time + timeout, &ip, &tag);
+                let table_suffix = match is_ipv6(&ip) {
+                    true => "6",
+                    false => ""
+                };
+
+                let request = format!("INSERT INTO scanners{} VALUES ({}, {}, {}, '{}', '{}')", table_suffix, &client_mix, time, time + timeout, &ip, &tag);
                 send_clickhouse_request(&agent, &config, &request);
-                let request = format!("INSERT INTO nats_data (client, hostname, blacklist, ip, until) VALUES ('{}', '{}', {}, '{}', {})", &client, &hostname, 1, &ip, time + timeout);
+                let request = format!("INSERT INTO nats_data{} (client, hostname, blacklist, ip, until) VALUES ('{}', '{}', {}, '{}', {})", table_suffix, &client, &hostname, 1, &ip, time + timeout);
                 send_clickhouse_request(&agent, &config, &request);
             }
             Ok(())
@@ -385,7 +390,7 @@ fn add_to_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist:
                 1 => 1800,
                 2 => 3600,
                 3..=7 => 3600 * (count - 1),
-                _ => 6 * 3600 * (count - 1)
+                _ => 24 * 3600 * (count - 1)
             }
         }
         Some(timeout) => timeout

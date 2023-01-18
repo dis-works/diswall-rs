@@ -45,22 +45,7 @@ pub(crate) fn install_client() -> io::Result<()> {
     if Path::new(LOG_PATH).exists() {
         info!("Not rewriting rsyslogd config file at: {}", LOG_PATH);
     } else {
-        fs::create_dir_all("/etc/rsyslog.d/")?;
-        fs::write(LOG_PATH, include_bytes!("../scripts/10-diswall.conf"))?;
-        info!("Created rsyslogd config file: {}", LOG_PATH);
-        match Command::new("systemctl")
-            .arg("restart")
-            .arg("rsyslog")
-            .stdout(Stdio::null()).spawn() {
-            Ok(mut child) => {
-                if let Ok(r) = child.wait() {
-                    if r.success() {
-                        info!("Rsyslogd restarted successfully");
-                    }
-                }
-            }
-            Err(e) => return Err(e)
-        }
+        install_rsyslog_config()?;
     }
     // Adding systemd service for diswall
     if Path::new(UNIT_PATH).exists() {
@@ -108,6 +93,28 @@ pub(crate) fn install_client() -> io::Result<()> {
     Ok(())
 }
 
+fn install_rsyslog_config() -> io::Result<()> {
+    use std::fs;
+
+    fs::create_dir_all("/etc/rsyslog.d/")?;
+    fs::write(LOG_PATH, include_bytes!("../scripts/10-diswall.conf"))?;
+    info!("Created rsyslogd config file: {}", LOG_PATH);
+    match Command::new("systemctl")
+        .arg("restart")
+        .arg("rsyslog")
+        .stdout(Stdio::null()).spawn() {
+        Ok(mut child) => {
+            if let Ok(r) = child.wait() {
+                if r.success() {
+                    info!("Rsyslogd restarted successfully");
+                }
+            }
+        }
+        Err(e) => return Err(e)
+    }
+    Ok(())
+}
+
 fn install_ipt_part() -> io::Result<()> {
     use std::fs;
     use std::path::Path;
@@ -146,7 +153,9 @@ fn install_ipt_part() -> io::Result<()> {
         let path = Path::new(IPT_INIT_PATH);
         match File::create(&path) {
             Ok(mut f) => {
-                let script_content = include_str!("../scripts/diswall_init.sh").replace("#diswall_init_rules", &buffer);
+                let mut script_content = include_str!("../scripts/diswall_init.sh").replace("#diswall_init_rules", &buffer);
+                let ip6_buffer = buffer.replace("iptables", "ip6tables");
+                script_content = script_content.replace("#diswall_init_rules", &ip6_buffer);
                 f.write_all(script_content.as_bytes()).expect(&format!("Error saving script to {}", IPT_INIT_PATH));
                 set_permissions(&path, Permissions::from_mode(0o700))?;
             }
@@ -209,7 +218,9 @@ fn install_nft_part() -> io::Result<()> {
         let path = Path::new(NFT_CONF_PATH);
         match File::create(&path) {
             Ok(mut f) => {
-                let script_content = include_str!("../scripts/nftables.conf").replace("#diswall_init_rules", &buffer);
+                let script_content = include_str!("../scripts/nftables.conf")
+                    .replace("#diswall_init_rules", &buffer)
+                    .replace("#diswall_init6_rules", &buffer);
                 buf.push_str(&script_content);
                 f.write_all(buf.as_bytes()).expect(&format!("Error saving config to {}", NFT_CONF_PATH));
                 set_permissions(&path, Permissions::from_mode(0o755))?;
@@ -344,6 +355,67 @@ pub(crate) fn update_client() -> io::Result<()> {
         Err(s) => error!("{}", s)
     }
     Ok(())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn update_fw_configs_for_ipv6() -> bool {
+    let fw_type = match get_installed_fw_type() {
+        Ok(fw_type) => fw_type,
+        Err(e) => {
+            error!("{}", e);
+            return false;
+        }
+    };
+
+    use std::path::Path;
+    use std::io::Write;
+    use std::fs::OpenOptions;
+    use std::fs;
+
+    match fw_type {
+        FwType::IpTables => {
+            let path = Path::new(IPT_INIT_PATH);
+            let contents = fs::read_to_string(path).unwrap_or_default();
+            if contents.contains("ip6tables -A INPUT") {
+                info!("Update of {} is not needed", IPT_INIT_PATH);
+                return true;
+            }
+            match OpenOptions::new().append(true).open(&path) {
+                Ok(mut f) => {
+                    info!("Updating config file {}", IPT_INIT_PATH);
+                    let script_content = include_str!("../scripts/diswall_init6.sh");
+                    f.write_all(script_content.as_bytes()).expect(&format!("Error saving script to {}", IPT_INIT_PATH));
+                }
+                Err(e) => {
+                    error!("Error saving script to {}: {}", IPT_INIT_PATH, e);
+                    return false;
+                }
+            }
+        },
+        FwType::NfTables => {
+            let path = Path::new(NFT_CONF_PATH);
+            let contents = fs::read_to_string(path).unwrap_or_default();
+            if contents.contains("ip6 saddr @diswall-bl6") {
+                info!("Update of {} is not needed", NFT_CONF_PATH);
+                return true;
+            }
+            match OpenOptions::new().append(true).open(&path) {
+                Ok(mut f) => {
+                    info!("Updating config file {}", NFT_CONF_PATH);
+                    let script_content = include_str!("../scripts/nftables6.conf");
+                    f.write_all(script_content.as_bytes()).expect(&format!("Error saving config to {}", NFT_CONF_PATH));
+                }
+                Err(e) => {
+                    error!("Error saving config to {}: {}", NFT_CONF_PATH, e);
+                    return false;
+                }
+            }
+        }
+    }
+    if install_rsyslog_config().is_err() {
+        return false;
+    }
+    true
 }
 
 #[cfg(not(windows))]

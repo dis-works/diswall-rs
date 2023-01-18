@@ -51,16 +51,20 @@ pub fn ipset_restore(data: &str) {
     }
 }
 
-/// nft add element ip filter block {192.168.44.77 timeout 30s}
+/// nft add element ip filter block {192.168.44.77 timeout 3600s}
 pub fn nft_add_or_del(action: &str, list_name: &str, data: &str) {
     let data = data.trim();
     let mut command = Command::new("nft");
     let data = match data.contains("timeout") {
         true => format!("{{{}s}}", data),
-        false => format!("{{{}}}", data)
+        false => format!("{{{} timeout 1h}}", data)
     };
-    command.args([action, "element", "ip", "filter", list_name, &data]);
-    match command.stdout(Stdio::null()).spawn() {
+    let ip = match data.contains('.') {
+        true => String::from("ip"),
+        false => String::from("ip6")
+    };
+    command.args([action, "element", &ip, "filter", list_name, &data]);
+    match command.stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
         Err(e) => {
             match action {
                 "add" => error!("Error adding {} to nft set: {}", data, e),
