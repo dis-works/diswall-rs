@@ -86,10 +86,12 @@ fn main() -> Result<(), i32> {
         }
     }
 
-    // If we have old configs we update them
-    if !update_fw_configs_for_ipv6() {
-        warn!("Error updating config for IPv6 support. Please, run `sudo diswall` one time to enable IPv6 support.");
-        return Ok(());
+    if !opt_matches.opt_present("install") {
+        // If we have old configs we update them
+        if !update_fw_configs_for_ipv6() {
+            warn!("Error updating config for IPv6 support. Please, run `sudo diswall` one time to enable IPv6 support.");
+            return Ok(());
+        }
     }
 
     if opt_matches.opt_present("upgrade-ipv6") {

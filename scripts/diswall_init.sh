@@ -45,6 +45,10 @@ ip6tables -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 ip6tables -A INPUT -i lo -j ACCEPT
 ip6tables -A INPUT -s fe80::/10 -j ACCEPT
 
+# For timed out responses from DNS servers
+ip6tables -A INPUT -p udp --sport 53 -j ACCEPT
+ip6tables -A INPUT -p tcp --sport 53 -j ACCEPT
+
 # Allow all IPs from diswall-wl
 ip6tables -A INPUT -m set --match-set diswall-wl6 src -j ACCEPT
 

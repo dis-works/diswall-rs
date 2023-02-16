@@ -34,7 +34,7 @@ Essentially, there are three parts of working DisWall:
 ### Simplified firewall configuration
 
 `iptables` or `nftables` is configured to allow local and established connections as well as connections from explicitly defined IPs and/or networks.
-In case of `iptables` it is done in `/usr/bin/diswall_init.sh` and this script is run by a service `diswall-ipt-init`,
+In case of `iptables` it is done in `/usr/bin/diswall_init.sh` and this script is run by a service `diswall-fw-init`,
 but in case of `nftables` it is done in `/etc/nftables.conf` and is run by `nftables` service itself.
 
 In simple terms, there are two lists/sets to allow connections (`diswall-wl`) and to block connections (`diswall-bl`).

@@ -124,7 +124,7 @@ fn install_ipt_part() -> io::Result<()> {
     if Path::new(UNIT_IPT_INIT_PATH).exists() {
         info!("Not rewriting service file: {}", UNIT_IPT_INIT_PATH);
     } else {
-        fs::write(UNIT_IPT_INIT_PATH, include_bytes!("../scripts/diswall-ipt-init.service"))?;
+        fs::write(UNIT_IPT_INIT_PATH, include_bytes!("../scripts/diswall-fw-init.service"))?;
         info!("Created systemd service file: {}", UNIT_IPT_INIT_PATH);
     }
     if Path::new(IPT_INIT_PATH).exists() {
@@ -132,11 +132,17 @@ fn install_ipt_part() -> io::Result<()> {
     } else {
         let services = get_listening_services();
         let mut buffer = String::new();
+        let mut added_ports = HashSet::new();
         for service in services {
             if service.dst_addr.ip().is_loopback() {
                 continue;
             }
             let s = if service.src_addr.ip().is_unspecified() {
+                // We don't want duplicates
+                if added_ports.contains(&service.dst_addr.port()) {
+                    continue;
+                }
+                added_ports.insert(service.dst_addr.port());
                 format!("iptables -A INPUT -p {} --dport {} -m comment --comment \"{}\" -j ACCEPT", &service.protocol, service.dst_addr.port(), &service.name)
             } else if service.src_addr.ip().is_ipv4() {
                 // We work with IPv4 only for now
@@ -155,11 +161,11 @@ fn install_ipt_part() -> io::Result<()> {
             Ok(mut f) => {
                 let mut script_content = include_str!("../scripts/diswall_init.sh").replace("#diswall_init_rules", &buffer);
                 let ip6_buffer = buffer.replace("iptables", "ip6tables");
-                script_content = script_content.replace("#diswall_init_rules", &ip6_buffer);
+                script_content = script_content.replace("#diswall_init6_rules", &ip6_buffer);
                 f.write_all(script_content.as_bytes()).expect(&format!("Error saving script to {}", IPT_INIT_PATH));
                 set_permissions(&path, Permissions::from_mode(0o700))?;
             }
-            Err(e) => error!("Error saving script to {}: {}", IPT_INIT_PATH, e)
+            Err(e) => error!("Error creating script {}: {}", IPT_INIT_PATH, e)
         }
     }
     Ok(())
@@ -197,11 +203,17 @@ fn install_nft_part() -> io::Result<()> {
         // We allow current listening services to accept connections
         let services = get_listening_services();
         let mut lines = Vec::new();
+        let mut added_ports = HashSet::new();
         for service in services {
             if service.dst_addr.ip().is_loopback() {
                 continue;
             }
             let line = if service.src_addr.ip().is_unspecified() {
+                // We don't want duplicates
+                if added_ports.contains(&service.dst_addr.port()) {
+                    continue;
+                }
+                added_ports.insert(service.dst_addr.port());
                 format!("    {} dport {} accept", &service.protocol, service.dst_addr.port())
             } else if service.src_addr.ip().is_ipv4() {
                 // We work with IPv4 only for now
