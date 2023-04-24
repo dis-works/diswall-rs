@@ -20,6 +20,11 @@ login = ""
 password = ""
 database = ""
 
+[nginx]
+# You can add some Nginx error logs here:
+# For example, "/var/log/nginx/error.log"
+logs = []
+
 # Configuration of NATS connection
 [nats]
 server = "diswall.stream"

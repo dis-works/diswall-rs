@@ -16,6 +16,8 @@ pub struct Config {
     #[serde(default = "default_pipe")]
     pub pipe_path: String,
     #[serde(default)]
+    pub nginx: Nginx,
+    #[serde(default)]
     pub nats: NatsConfig,
     #[serde(skip)]
     pub fw_type: FwType,
@@ -109,6 +111,7 @@ impl Default for Config {
         let clickhouse = ClickHouseConfig::default();
         Config {
             pipe_path: default_pipe(),
+            nginx: Nginx::default(),
             nats,
             fw_type: FwType::IpTables,
             clickhouse,
@@ -119,6 +122,12 @@ impl Default for Config {
             ipset_white_list: default_ipset_white_list(),
         }
     }
+}
+
+/// Nginx error logs configuration, a part of main config structure, is loaded from same TOML
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Nginx {
+    pub(crate) logs: Vec<String>
 }
 
 /// NATS client configuration, a part of main config structure, is loaded from same TOML

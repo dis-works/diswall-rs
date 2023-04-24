@@ -24,6 +24,7 @@ use lru::LruCache;
 use utils::valid_ip;
 #[cfg(not(windows))]
 use crate::install::uninstall_client;
+#[cfg(not(windows))]
 use crate::install::update_fw_configs_for_ipv6;
 
 mod config;
@@ -32,6 +33,7 @@ mod server;
 mod timer;
 mod types;
 mod utils;
+mod addons;
 #[cfg(not(windows))]
 mod install;
 
@@ -88,6 +90,7 @@ fn main() -> Result<(), i32> {
 
     if !opt_matches.opt_present("install") {
         // If we have old configs we update them
+        #[cfg(not(windows))]
         if !update_fw_configs_for_ipv6() {
             warn!("Error updating config for IPv6 support. Please, run `sudo diswall` one time to enable IPv6 support.");
             return Ok(());
@@ -218,6 +221,17 @@ fn main() -> Result<(), i32> {
                 }
             });
             let _ = timer.start();
+        }
+    }
+
+    if !config.nginx.logs.is_empty() {
+        // For every log path in config we start new thread that will read that log
+        for log in &config.nginx.logs {
+            let log = log.clone();
+            let pipe_path = config.pipe_path.clone();
+            thread::spawn(move || {
+                addons::nginx::process_log_file(&log, &pipe_path);
+            });
         }
     }
 

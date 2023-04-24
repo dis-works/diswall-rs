@@ -1,0 +1,3 @@
+/favicon.ico
+/robots.txt
+/.well-known/security.txt
