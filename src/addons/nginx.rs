@@ -3,6 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::thread;
 use std::time::Duration;
+use log::{debug, error, info, warn};
 use time::PrimitiveDateTime;
 
 const WL: &str = include_str!("whitelist.txt");
@@ -13,7 +14,7 @@ pub fn process_log_file(file_name: &String, pipe_path: &str) {
     let mut file = match File::open(&file_name) {
         Ok(file) => file,
         Err(error) => {
-            println!("Error opening file: {}", error);
+            error!("Error opening file: {}", error);
             return;
         }
     };
@@ -41,9 +42,9 @@ pub fn process_log_file(file_name: &String, pipe_path: &str) {
                         }
                         for client in gotchas {
                             let score = scores.remove(&client).unwrap();
-                            println!("Client {} -> {:.2}", &client, score);
+                            debug!("Baning http bot {} -> {:.2}", &client, score);
                             if let Err(e) = append_to_file(pipe_path, &format!("{}|http\n", &client)) {
-                                println!("Error writing to DisWall pipe! {}", e);
+                                warn!("Error writing to DisWall pipe! {}", e);
                             }
                         }
                     }
@@ -53,14 +54,14 @@ pub fn process_log_file(file_name: &String, pipe_path: &str) {
                     let mut file = match File::open(&file_name) {
                         Ok(file) => file,
                         Err(error) => {
-                            println!("Error opening file: {}", error);
+                            error!("Error opening file: {}", error);
                             return;
                         }
                     };
 
                     let new_inode = get_inode(&file);
                     if new_inode != inode {
-                        println!("Log file rotated, reopening new file");
+                        info!("Log file rotated, reopening new file");
                         let _ = file.seek(SeekFrom::End(0));
                         reader = BufReader::new(file);
                         inode = new_inode;
@@ -69,7 +70,7 @@ pub fn process_log_file(file_name: &String, pipe_path: &str) {
                 }
             }
             Err(e) => {
-                println!("Error reading log: {}", e);
+                error!("Error reading log: {}", e);
                 return;
             }
         }
@@ -119,19 +120,19 @@ fn process_log_line(line: &String, wl: &HashSet<&str>, bl: &HashSet<&str>, score
             }
             if line.server == "_" {
                 if let Some(val) = scores.get_mut(&line.client) {
-                    *val += 0.5;
+                    *val += 0.3;
                 } else {
-                    scores.insert(line.client.clone(), 0.5);
+                    scores.insert(line.client.clone(), 0.3);
                 }
             }
             if path.contains("/wp-") && !(path.ends_with(".jpg") || path.ends_with(".jpeg") || path.ends_with(".png")) {
                 if let Some(val) = scores.get_mut(&line.client) {
-                    *val += 0.5;
+                    *val += 0.3;
                 } else {
-                    scores.insert(line.client.clone(), 0.5);
+                    scores.insert(line.client.clone(), 0.3);
                 }
             }
-            if path.contains("shell") || path.contains("wget") || path.contains(".sql") || path.contains(".db") {
+            if path.contains("shell") || path.contains("exec") || path.contains("wget") || path.contains(".sql") || path.contains(".db") {
                 if let Some(val) = scores.get_mut(&line.client) {
                     *val += 1.0;
                 } else {
