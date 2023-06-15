@@ -1,5 +1,6 @@
 use std::convert::Infallible;
 use std::{env, io, thread};
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::net::IpAddr;
@@ -7,7 +8,7 @@ use std::num::NonZeroUsize;
 use std::process::{Command, exit, Stdio};
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use getopts::{Matches, Options};
 use log::{debug, error, info, LevelFilter, trace, warn};
 use nats::Connection;
@@ -475,10 +476,57 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
     let block_list = config.ipset_black_list.as_str();
     let mut line = String::new();
     let delay = Duration::from_millis(2);
+    let mut banned = HashMap::<String, (Instant, i32)>::new();
+    // Usual scanned ports of known services like databases, etc.
+    let service_ports = [1025, 1433, 1434, 1521, 1583, 1830, 2049, 3050, 3306, 3351, 3389, 5432, 5900, 6379, 7210, 8080, 8081, 8443, 9200, 9216, 9300, 11211];
     loop {
         let len = reader.read_line(&mut line)?;
         if len > 0 {
-            process_ip(&config, &nats, banned_count, &cache, &block_list, &line);
+            if line.contains(' ') {
+                let parts = line.trim().split(' ').collect::<Vec<_>>();
+                if parts.len() != 3 {
+                    continue;
+                }
+                let ip = parts[0];
+                let _protocol = parts[1];
+                let port = parts[2].parse::<u16>().unwrap_or_default();
+                // If the packet is going to sensitive port, we ban it no matter what
+                if port < 1025 || service_ports.contains(&port) {
+                    debug!("{ip} Fast-banning, as scanning port {port}");
+                    process_ip(&config, &nats, banned_count, &cache, &block_list, ip);
+                } else {
+                    // Sometimes the kernel looses info about legit connections, and some packets are coming as not related to any connections.
+                    // For these packets we are trying to count those packets, and don't ban on random glitch-packet.
+                    match banned.get_mut(ip) {
+                        Some((time, count)) => {
+                            // For ephemeral ports we use more relaxed time
+                            let interval = if port >= 49152 {
+                                60
+                            } else {
+                                3600
+                            };
+                            if time.elapsed().as_secs() > interval {
+                                *count = 1;
+                                *time = Instant::now();
+                            } else {
+                                *count += 1;
+                                debug!("{ip} Incremented count to {count}, port {port}");
+                                if *count >= 3 {
+                                    debug!("{ip} Banned for {count} port scans, port {port}");
+                                    process_ip(&config, &nats, banned_count, &cache, &block_list, ip);
+                                    banned.remove(ip);
+                                }
+                            }
+                        }
+                        None => {
+                            debug!("{ip} First attempt of port {port} scan, saving");
+                            banned.insert(ip.to_owned(), (Instant::now(), 1));
+                        }
+                    }
+                }
+            } else {
+                process_ip(&config, &nats, banned_count, &cache, &block_list, &line);
+            }
         } else {
             thread::sleep(delay);
         }
