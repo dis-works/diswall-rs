@@ -165,6 +165,11 @@ fn main() -> Result<(), i32> {
         }
     }
 
+    #[cfg(not(windows))]
+    if let Err(e) = crate::install::update_rsyslog_config() {
+        error!("Error updating rsyslog config: {e}");
+    }
+
     debug!("Loaded config:\n{:#?}", &config);
     let cache = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(8).unwrap())));
 

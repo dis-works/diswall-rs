@@ -115,6 +115,33 @@ fn install_rsyslog_config() -> io::Result<()> {
     Ok(())
 }
 
+pub fn update_rsyslog_config() -> io::Result<()> {
+    use std::fs;
+
+    fs::create_dir_all("/etc/rsyslog.d/")?;
+    if let Ok(text) = fs::read_to_string(LOG_PATH) {
+        if text.contains("PROTO=([A-Za-z0-9]+)") {
+            return Ok(());
+        }
+    }
+    fs::write(LOG_PATH, include_bytes!("../scripts/10-diswall.conf"))?;
+    info!("Updated rsyslogd config file: {}", LOG_PATH);
+    match Command::new("systemctl")
+        .arg("restart")
+        .arg("rsyslog")
+        .stdout(Stdio::null()).spawn() {
+        Ok(mut child) => {
+            if let Ok(r) = child.wait() {
+                if r.success() {
+                    info!("Rsyslogd restarted successfully");
+                }
+            }
+        }
+        Err(e) => return Err(e)
+    }
+    Ok(())
+}
+
 fn install_ipt_part() -> io::Result<()> {
     use std::fs;
     use std::path::Path;
