@@ -696,6 +696,12 @@ fn setup_logger(opt_matches: &Matches) {
     if opt_matches.opt_present("d") || env::var("DISWALL_DEBUG").is_ok() {
         level = LevelFilter::Trace;
     }
+    // If the daemon is run by systemd, then we don't need time in the log
+    let time_level = if env::var_os("INVOCATION_ID").is_some() {
+        LevelFilter::Off
+    } else {
+        LevelFilter::Error
+    };
     let config = ConfigBuilder::new()
         .add_filter_ignore_str("rustls::")
         .add_filter_ignore_str("ureq::")
@@ -703,7 +709,7 @@ fn setup_logger(opt_matches: &Matches) {
         .set_location_level(LevelFilter::Off)
         .set_target_level(LevelFilter::Error)
         .set_level_padding(LevelPadding::Right)
-        .set_time_level(LevelFilter::Error)
+        .set_time_level(time_level)
         .set_time_format_custom(format_description!("[hour]:[minute]:[second].[subsecond digits:3]"))
         .set_time_offset_to_local()
         .unwrap()
