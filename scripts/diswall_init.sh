@@ -29,7 +29,8 @@ iptables -A INPUT -p icmp --icmp-type echo-request  -j ACCEPT
 #diswall_init_rules
 
 # Log all other packets:
-iptables -A INPUT -j LOG --log-prefix "diswall-log: "
+iptables -A INPUT -p udp -j LOG --log-prefix "diswall-log: "
+iptables -A INPUT -p tcp -j LOG --log-prefix "diswall-log: "
 
 ### IPv6 rules
 
@@ -61,4 +62,5 @@ ip6tables -A INPUT -p icmpv6 -j ACCEPT
 #diswall_init6_rules
 
 # Log all other packets:
-ip6tables -A INPUT -j LOG --log-prefix "diswall-log: "
+ip6tables -A INPUT -p udp -j LOG --log-prefix "diswall-log: "
+ip6tables -A INPUT -p tcp -j LOG --log-prefix "diswall-log: "

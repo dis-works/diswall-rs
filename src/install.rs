@@ -12,6 +12,7 @@ use log::{error, info, warn};
 #[cfg(not(windows))]
 use nix::unistd::mkfifo;
 use crate::firewall::get_installed_fw_type;
+use crate::utils::replace_string_in_file;
 use crate::{FwType, utils};
 
 const RELEASE_URL: &str = "https://api.github.com/repos/dis-works/diswall-rs/releases/latest";
@@ -375,6 +376,19 @@ pub(crate) fn update_client() -> io::Result<()> {
                     info!("Saved new binary to {}", BIN_PATH);
                     set_permissions(BIN_PATH, Permissions::from_mode(0o755))?;
                     info!("Permissions set successfully");
+
+                    match Command::new("diswall").arg("--after-update").stdout(Stdio::null()).spawn() {
+                        Ok(mut child) => {
+                            if let Ok(r) = child.wait() {
+                                if r.success() {
+                                    info!("After update processed successfully");
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Err(_) => ()
+                    }
+
                     // Restarting service
                     match Command::new("systemctl").arg("restart").arg("diswall").stdout(Stdio::null()).spawn() {
                         Ok(mut child) => {
@@ -453,6 +467,41 @@ pub(crate) fn update_fw_configs_for_ipv6() -> bool {
     }
     if install_rsyslog_config().is_err() {
         return false;
+    }
+    true
+}
+
+/// Change single log directive to two separate directives
+pub(crate) fn update_fw_configs_for_separated_protocols() -> bool {
+    let fw_type = match get_installed_fw_type() {
+        Ok(fw_type) => fw_type,
+        Err(e) => {
+            error!("{}", e);
+            return false;
+        }
+    };
+
+    let (updated, path) = match fw_type {
+        FwType::IpTables => {
+            let old = "iptables -A INPUT -j LOG --log-prefix \"diswall-log: \"";
+            let new = "iptables -A INPUT -p udp -j LOG --log-prefix \"diswall-log: \"\niptables -A INPUT -p tcp -j LOG --log-prefix \"diswall-log: \"";
+            let updated = replace_string_in_file(IPT_INIT_PATH, old, new);
+            let old = "ip6tables -A INPUT -j LOG --log-prefix \"diswall-log: \"";
+            let new = "ip6tables -A INPUT -p udp -j LOG --log-prefix \"diswall-log: \"\nip6tables -A INPUT -p tcp -j LOG --log-prefix \"diswall-log: \"";
+            let updated = updated && replace_string_in_file(IPT_INIT_PATH, old, new);
+            (updated, IPT_INIT_PATH)
+        },
+        FwType::NfTables => {
+            let old = "    log prefix \"diswall-log: \"";
+            let new = "    tcp dport 1-65535 log prefix \"diswall-log: \" drop\n    udp dport 1-65535 log prefix \"diswall-log: \" drop";
+            (replace_string_in_file(NFT_CONF_PATH, old, new), NFT_CONF_PATH)
+        }
+    };
+    if updated {
+        if let Err(e) = crate::firewall::apply_fw_config(path) {
+            error!("Error applying firewall config: {}", e);
+            return false;
+        }
     }
     true
 }

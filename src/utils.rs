@@ -1,4 +1,5 @@
 use std::net::{IpAddr, Ipv6Addr};
+use log::{debug, error};
 
 /// Reduces all series of spaces to one space
 pub fn reduce_spaces(string: &str) -> String {
@@ -63,4 +64,24 @@ pub fn valid_ip(ip: &str) -> bool {
         Ok(_) => true,
         Err(_) => false,
     }
+}
+
+pub fn replace_string_in_file(filename: &str, find: &str, replace: &str) -> bool {
+    use std::path::Path;
+    use std::fs;
+
+    let path = Path::new(filename);
+    let contents = fs::read_to_string(path).unwrap_or_default();
+    if contents.contains(find) {
+        debug!("Updating {filename}...");
+        let replaced = contents.replace(find, replace);
+        match fs::write(path, replaced.as_bytes()) {
+            Ok(_) => {
+                debug!("{filename} updated successfully");
+                return true;
+            }
+            Err(e) => error!("{filename} update error: {}", e)
+        }
+    }
+    false
 }

@@ -98,20 +98,22 @@ fn main() -> Result<(), i32> {
         }
     }
 
-    if opt_matches.opt_present("upgrade-ipv6") {
-        // We did the upgrade 2 lines before
-        // Restarting service
-        match Command::new("systemctl").arg("restart").arg("diswall").stdout(Stdio::null()).spawn() {
-            Ok(mut child) => {
-                if let Ok(r) = child.wait() {
-                    if r.success() {
-                        info!("Updated successfully, service restarted");
-                        return Ok(());
+    if opt_matches.opt_present("after-update") {
+        if install::update_fw_configs_for_separated_protocols() {
+            info!("Firewall config updated");
+            match Command::new("systemctl").arg("restart").arg("diswall").stdout(Stdio::null()).spawn() {
+                Ok(mut child) => {
+                    if let Ok(r) = child.wait() {
+                        if r.success() {
+                            info!("Updated successfully, service restarted");
+                            return Ok(());
+                        }
                     }
                 }
+                Err(_) => ()
             }
-            Err(_) => ()
         }
+        return Ok(());
     }
 
     if opt_matches.opt_present("install") {
@@ -289,11 +291,11 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
                 match config.fw_type {
                     FwType::IpTables => {
                         // add diswall-wl 1.2.3.4 timeout 1234
-                        buf.push_str(&format!("add {}{} {}\n", &config.ipset_white_list, suffix, line));
+                        buf.push_str(&format!("add {}{suffix} {line}\n", &config.ipset_white_list));
                     }
                     FwType::NfTables => {
                         // add element ip filter diswall-wl {1.2.3.4 timeout 1234s}
-                        buf.push_str(&format!("add element ip filter {}{} {{{}s}}\n", &config.ipset_white_list, suffix, line));
+                        buf.push_str(&format!("add element ip{suffix} filter {}{suffix} {{{line}s}}\n", &config.ipset_white_list));
                     }
                 }
                 trace!("To whitelist: {}", line);
@@ -317,17 +319,18 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
                     true => "6",
                     false => ""
                 };
-                match config.fw_type {
+                let line = match config.fw_type {
                     FwType::IpTables => {
                         // add diswall-bl 1.2.3.4 timeout 1234
-                        buf.push_str(&format!("add {}{} {}\n", &config.ipset_black_list, suffix, line));
+                        format!("add {}{suffix} {line}\n", &config.ipset_black_list)
                     }
                     FwType::NfTables => {
                         // add element ip filter diswall-bl {1.2.3.4 timeout 1234s}
-                        buf.push_str(&format!("add element ip filter {}{} {{{}s}}\n", &config.ipset_black_list, suffix, line));
+                        format!("add element ip{suffix} filter {}{suffix} {{{line}s}}\n", &config.ipset_black_list)
                     }
-                }
-                trace!("To blacklist: {}", line);
+                };
+                buf.push_str(&line);
+                trace!("To blacklist: {}", &line);
             }
             match config.fw_type {
                 FwType::IpTables => firewall::ipset_restore(&buf),
@@ -484,9 +487,11 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
     let mut banned = HashMap::<String, (Instant, i32)>::new();
     // Usual scanned ports of known services like databases, etc.
     let service_ports = [1025, 1433, 1434, 1521, 1583, 1830, 2049, 3050, 3306, 3351, 3389, 5432, 5900, 6379, 7210, 8080, 8081, 8443, 9200, 9216, 9300, 11211];
+    const EPHEMERAL_PORT_START: u16 = 49152;
     loop {
         let len = reader.read_line(&mut line)?;
         if len > 0 {
+            trace!("Got line: {line}");
             if line.contains(' ') {
                 let parts = line.trim().split(' ').collect::<Vec<_>>();
                 if parts.len() != 3 {
@@ -494,29 +499,34 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
                 }
                 let ip = parts[0];
                 let _protocol = parts[1];
-                let port = parts[2].parse::<u16>().unwrap_or_default();
+                let port = match parts[2].parse::<u16>() {
+                    Ok(port) => port,
+                    Err(_) => continue
+                };
                 // If the packet is going to sensitive port, we ban it no matter what
                 if port < 1025 || service_ports.contains(&port) {
                     debug!("{ip} Fast-banning, as scanning port {port}");
                     process_ip(&config, &nats, banned_count, &cache, &block_list, ip);
+                    banned.remove(ip);
                 } else {
                     // Sometimes the kernel looses info about legit connections, and some packets are coming as not related to any connections.
                     // For these packets we are trying to count those packets, and don't ban on random glitch-packet.
                     match banned.get_mut(ip) {
                         Some((time, count)) => {
-                            // For ephemeral ports we use more relaxed time
-                            let interval = if port >= 49152 {
-                                60
+                            // For ephemeral ports we use more relaxed blocking
+                            let max_count = if port >= EPHEMERAL_PORT_START {
+                                3
                             } else {
-                                3600
+                                1
                             };
-                            if time.elapsed().as_secs() > interval {
+                            if time.elapsed().as_secs() > 3600 {
                                 *count = 1;
                                 *time = Instant::now();
+                                debug!("{ip} Resetting count to {count}, port {port}");
                             } else {
                                 *count += 1;
                                 debug!("{ip} Incremented count to {count}, port {port}");
-                                if *count >= 3 {
+                                if *count >= max_count {
                                     debug!("{ip} Banned for {count} port scans, port {port}");
                                     process_ip(&config, &nats, banned_count, &cache, &block_list, ip);
                                     banned.remove(ip);
@@ -524,8 +534,13 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
                             }
                         }
                         None => {
-                            debug!("{ip} First attempt of port {port} scan, saving");
-                            banned.insert(ip.to_owned(), (Instant::now(), 1));
+                            if port >= EPHEMERAL_PORT_START {
+                                debug!("{ip} First attempt of port {port} scan, saving");
+                                banned.insert(ip.to_owned(), (Instant::now(), 1));
+                            } else {
+                                debug!("{ip} Banned for first port scan, port {port}");
+                                process_ip(&config, &nats, banned_count, &cache, &block_list, ip);
+                            }
                         }
                     }
                 }
@@ -660,7 +675,7 @@ fn get_options(args: &Vec<String>) -> (Options, Matches) {
     opts.optflag("v", "version", "Print version and exit");
     opts.optflag("", "install", "Install DisWall as system service (in client mode)");
     opts.optflag("", "update", "Update DisWall to latest release from GitHub");
-    opts.optflag("", "upgrade-ipv6", "Update DisWall to latest release from GitHub");
+    opts.optflag("", "after-update", "Perform additional config updates after updating DisWall");
     opts.optflag("", "uninstall", "Uninstall DisWall from your server");
     opts.optflag("d", "debug", "Show trace messages, more than debug");
     opts.optflag("g", "generate", "Generate fresh configuration file. It is better to redirect contents to file.");

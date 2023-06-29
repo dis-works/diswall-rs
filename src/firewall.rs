@@ -1,5 +1,5 @@
 use std::process::{Command, Stdio};
-use std::io::Write;
+use std::io::{Error, ErrorKind, Write};
 #[allow(unused_imports)]
 use log::{debug, error, info, warn};
 use crate::config::FwType;
@@ -121,4 +121,38 @@ pub fn get_installed_fw_type() -> Result<FwType, String> {
         Err(_) => {}
     }
     Err(String::from("Could not determine installed firewall type."))
+}
+
+pub fn apply_fw_config(filename: &str) -> Result<(), Error> {
+    if filename.ends_with(".sh") {
+        match Command::new("bash")
+            .arg(filename)
+            .stdout(Stdio::null()).spawn() {
+            Ok(mut child) => {
+                if let Ok(r) = child.wait() {
+                    if r.success() {
+                        info!("Firewall config applied successfully");
+                    }
+                }
+            }
+            Err(e) => return Err(e)
+        }
+    } else if filename.ends_with(".conf") {
+        match Command::new("nft")
+            .arg("-f")
+            .arg(filename)
+            .stdout(Stdio::null()).spawn() {
+            Ok(mut child) => {
+                if let Ok(r) = child.wait() {
+                    if r.success() {
+                        info!("Firewall config applied successfully");
+                    }
+                }
+            }
+            Err(e) => return Err(e)
+        }
+    } else {
+        return Err(ErrorKind::Unsupported.into());
+    }
+    Ok(())
 }
