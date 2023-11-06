@@ -181,6 +181,11 @@ fn main() -> Result<(), i32> {
         let nats = nats::Options::with_user_pass(&config.nats.client_name, &config.nats.client_pass)
             .with_name("DisWall")
             .error_callback(|error| error!("NATS error: {}", error))
+            .retry_on_failed_connect()
+            .reconnect_callback(|| info!("Reconnected to NATS server"))
+            .reconnect_buffer_size(32 * 1024 * 1024)
+            .max_reconnects(1_000_000)
+            .reconnect_delay_callback(reconnect_timer)
             .connect(format!("nats://{}:{}", &config.nats.server, &config.nats.port));
         match nats {
             Err(e) => {
@@ -247,6 +252,14 @@ fn main() -> Result<(), i32> {
         error!("Error reading pipe: {}", e);
     }
     Ok(())
+}
+
+fn reconnect_timer(c: usize) -> Duration {
+    if c < 10 {
+        Duration::from_millis(1000 + (rand::random::<u64>() % 200))
+    } else {
+        Duration::from_millis(5000 + (rand::random::<u64>() % 500))
+    }
 }
 
 fn process_ips_from_parameters(config: &Config, opt_matches: &Matches, nats: Option<Connection>) -> bool {
