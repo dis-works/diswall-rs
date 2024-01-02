@@ -66,6 +66,7 @@ pub fn valid_ip(ip: &str) -> bool {
     }
 }
 
+#[allow(dead_code)]
 pub fn replace_string_in_file(filename: &str, find: &str, replace: &str) -> bool {
     use std::path::Path;
     use std::fs;

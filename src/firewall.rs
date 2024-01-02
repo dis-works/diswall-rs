@@ -123,6 +123,7 @@ pub fn get_installed_fw_type() -> Result<FwType, String> {
     Err(String::from("Could not determine installed firewall type."))
 }
 
+#[allow(dead_code)]
 pub fn apply_fw_config(filename: &str) -> Result<(), Error> {
     if filename.ends_with(".sh") {
         match Command::new("bash")

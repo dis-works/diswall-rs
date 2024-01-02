@@ -27,6 +27,7 @@ use utils::valid_ip;
 use crate::install::uninstall_client;
 #[cfg(not(windows))]
 use crate::install::update_fw_configs_for_ipv6;
+use crate::ports::Ports;
 
 mod config;
 mod firewall;
@@ -37,6 +38,7 @@ mod utils;
 mod addons;
 #[cfg(not(windows))]
 mod install;
+mod ports;
 
 fn main() -> Result<(), i32> {
     let args: Vec<String> = env::args().collect();
@@ -99,6 +101,7 @@ fn main() -> Result<(), i32> {
     }
 
     if opt_matches.opt_present("after-update") {
+        #[cfg(not(windows))]
         if install::update_fw_configs_for_separated_protocols() {
             info!("Firewall config updated");
             match Command::new("systemctl").arg("restart").arg("diswall").stdout(Stdio::null()).spawn() {
@@ -501,6 +504,7 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
     // Usual scanned ports of known services like databases, etc.
     let service_ports = [1025, 1433, 1434, 1521, 1583, 1830, 2049, 3050, 3306, 3351, 3389, 5432, 5900, 6379, 7210, 8080, 8081, 8443, 9200, 9216, 9300, 11211];
     const EPHEMERAL_PORT_START: u16 = 49152;
+    let open_ports = Ports::new(60);
     loop {
         let len = reader.read_line(&mut line)?;
         if len > 0 {
@@ -516,6 +520,11 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
                     Ok(port) => port,
                     Err(_) => continue
                 };
+                if open_ports.is_open(port) {
+                    trace!("Skipping open port {port}");
+                    line.clear();
+                    continue;
+                }
                 // If the packet is going to sensitive port, we ban it no matter what
                 if port < 1025 || service_ports.contains(&port) {
                     debug!("{ip} Fast-banning, as scanning port {port}");
