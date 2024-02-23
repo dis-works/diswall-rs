@@ -52,25 +52,37 @@ pub fn ipset_restore(data: &str) {
 }
 
 /// nft add element ip filter block {192.168.44.77 timeout 3600s}
-pub fn nft_add_or_del(action: &str, list_name: &str, data: &str) {
+pub fn nft_add(list_name: &str, data: &str) {
+    let data = data.trim();
+    let (ip, timeout) = match data.contains("timeout") {
+        true => {
+            let parts = data.split(" ").collect::<Vec<_>>();
+            (parts[0].trim().to_owned(), format!("{}s", parts[2]))
+        },
+        false => (data.to_owned(), String::from("1h"))
+    };
+    let ip_type = match ip.contains('.') {
+        true => String::from("ip"),
+        false => String::from("ip6")
+    };
+    // Add, delete, add with timeout (https://serverfault.com/a/1097121)
+    let com = format!("add element {ip_type} filter {list_name} {{ {ip} }}\n\
+    delete element {ip_type} filter {list_name} {{ {ip} }}\n\
+    add element {ip_type} filter {list_name} {{ {ip} timeout {timeout} }}\n");
+    nft_restore(&com);
+}
+
+pub fn nft_del(list_name: &str, data: &str) {
     let data = data.trim();
     let mut command = Command::new("nft");
-    let data = match data.contains("timeout") {
-        true => format!("{{{}s}}", data),
-        false => format!("{{{} timeout 1h}}", data)
-    };
     let ip = match data.contains('.') {
         true => String::from("ip"),
         false => String::from("ip6")
     };
-    command.args([action, "element", &ip, "filter", list_name, &data]);
+    command.args(["delete", "element", &ip, "filter", list_name, &data]);
     match command.stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
         Err(e) => {
-            match action {
-                "add" => error!("Error adding {} to nft set: {}", data, e),
-                "del" => error!("Error removing {} from nft set: {}", data, e),
-                &_ => error!("Error ipset command: {}", e)
-            }
+            error!("Error removing {} from nft set: {}", data, e)
         }
         Ok(mut child) => {
             let _ = child.wait();
@@ -91,6 +103,9 @@ pub fn nft_restore(data: &str) {
             error!("Error restoring ipset rules {}", e);
             return;
         }
+        let _ = stdin.flush();
+        drop(stdin);
+        let _ = command.wait();
     }
 }
 

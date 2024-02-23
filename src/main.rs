@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::net::IpAddr;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroUsize};
 use std::process::{Command, exit, Stdio};
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -20,7 +20,7 @@ use crate::server::run_server;
 use crate::install::{install_client, update_client};
 use crate::timer::HourlyTimer;
 use crate::types::Stats;
-use crate::utils::{get_first_part, get_ip_and_tag, is_ipv6, reduce_spaces};
+use crate::utils::{get_first_part, get_ip_and_tag, get_ip_and_timeout, is_ipv6, reduce_spaces};
 use lru::LruCache;
 use utils::valid_ip;
 #[cfg(not(windows))]
@@ -28,6 +28,9 @@ use crate::install::uninstall_client;
 #[cfg(not(windows))]
 use crate::install::update_fw_configs_for_ipv6;
 use crate::ports::Ports;
+use crate::state::{Blocked, State};
+use crate::ui::ui_client::UiClient;
+use crate::ui::ui_server::UiServer;
 
 mod config;
 mod firewall;
@@ -39,6 +42,10 @@ mod addons;
 #[cfg(not(windows))]
 mod install;
 mod ports;
+mod state;
+mod ui;
+
+const UI_SOCK_ADDR: &'static str = "/run/diswall.sock";
 
 fn main() -> Result<(), i32> {
     let args: Vec<String> = env::args().collect();
@@ -67,6 +74,16 @@ fn main() -> Result<(), i32> {
             println!("Killed connection with {}", &ip);
         }
         return Ok(())
+    }
+
+    if opt_matches.opt_present("i") {
+        setup_logger(&opt_matches);
+        info!("Starting DisWall UI...");
+        let client = UiClient::new(UI_SOCK_ADDR.to_string());
+        if let Err(e) = client.start() {
+            error!("Error running UI: {e}");
+        }
+        return Ok(());
     }
 
     let file_name = match opt_matches.opt_str("c") {
@@ -177,6 +194,7 @@ fn main() -> Result<(), i32> {
 
     debug!("Loaded config:\n{:#?}", &config);
     let cache = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(8).unwrap())));
+    let state = Arc::new(Mutex::new(State::new()));
 
     let nats = if !config.local_only && !config.nats.server.is_empty() {
         //let hostname = config::get_hostname();
@@ -202,7 +220,7 @@ fn main() -> Result<(), i32> {
                 }
                 if !config.server_mode {
                     info!("Connected to NATS server, setting up handlers");
-                    start_nats_handlers(&mut config, &nats, Arc::clone(&cache));
+                    start_nats_handlers(&mut config, &nats, Arc::clone(&cache), Arc::clone(&state));
                 }
                 Some(nats)
             }
@@ -251,7 +269,13 @@ fn main() -> Result<(), i32> {
         }
     }
 
-    if let Err(e) = lock_on_pipe(config, nats, &banned_count, Arc::clone(&cache)) {
+    let s = Arc::clone(&state);
+    thread::spawn(|| {
+        let server = UiServer::new(UI_SOCK_ADDR.to_string(), s);
+        server.start();
+    });
+
+    if let Err(e) = lock_on_pipe(config, nats, &banned_count, Arc::clone(&cache), Arc::clone(&state)) {
         error!("Error reading pipe: {}", e);
     }
     Ok(())
@@ -292,7 +316,7 @@ fn process_ips_from_parameters(config: &Config, opt_matches: &Matches, nats: Opt
     false
 }
 
-fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<LruCache<String, bool>>>) {
+fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<LruCache<String, bool>>>, state: Arc<Mutex<State>>) {
     let msg = String::new();
     match nats.request(&config.nats.wl_init_subject, &msg) {
         Ok(message) => {
@@ -330,7 +354,11 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
             let string = String::from_utf8(message.data).unwrap_or(String::default());
             let mut buf = String::new();
             for line in string.lines() {
-                let ip = get_first_part(line);
+                let (ip, timeout) = get_ip_and_timeout(&line);
+                let timeout = match timeout.parse::<i64>() {
+                    Ok(t) => t,
+                    Err(_) => 86400
+                };
                 let suffix = match is_ipv6(&ip) {
                     true => "6",
                     false => ""
@@ -347,6 +375,18 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
                 };
                 buf.push_str(&line);
                 trace!("To blacklist: {}", &line);
+                if let Ok(mut state) = state.lock() {
+                    if let Ok(ip) = ip.parse() {
+                        info!("Adding IP {}", &ip);
+                        let blocked = Blocked::new(ip, None, timeout as u64);
+                        state.add_blocked(blocked);
+                    } else {
+                        error!("Error parsing IP {} from line '{}'", &ip, &line);
+                    }
+                }
+            }
+            if let Ok(state) = state.lock() {
+                info!("Added {} items to state", &state.blocked.len());
             }
             match config.fw_type {
                 FwType::IpTables => firewall::ipset_restore(&buf),
@@ -378,7 +418,7 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
                             firewall::ipset_add_or_del("add", &list, split[0], Some(split[1].to_owned()));
                         }
                     },
-                    FwType::NfTables => firewall::nft_add_or_del("add", &list, split[0])
+                    FwType::NfTables => firewall::nft_add(&list, split[0])
                 }
             }
             Ok(())
@@ -415,7 +455,7 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
                     };
                     match fw_type {
                         FwType::IpTables => firewall::ipset_add_or_del("add", &list, &ip, None),
-                        FwType::NfTables => firewall::nft_add_or_del("add", &list, &ip)
+                        FwType::NfTables => firewall::nft_add(&list, &ip)
                     }
                     let _ = kill_connection(&ip);
                     if let Ok(mut cache) = cache.lock() {
@@ -445,9 +485,9 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
                     warn!("Too long tag '{}' from {}", &tag, &string);
                     return Ok(());
                 }
-                let data = match tag.parse::<i64>() {
-                    Ok(timeout) => format!("{} timeout {}", &ip, timeout),
-                    Err(_) => ip.clone()
+                let (data, timeout) = match tag.parse::<i64>() {
+                    Ok(timeout) => (format!("{} timeout {}", &ip, timeout), timeout),
+                    Err(_) => (ip.clone(), 86400)
                 };
                 let list = match is_ipv6(&ip) {
                     true => format!("{}6", list_name),
@@ -455,7 +495,13 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
                 };
                 match fw_type {
                     FwType::IpTables => firewall::ipset_add_or_del("add", &list, &data, None),
-                    FwType::NfTables => firewall::nft_add_or_del("add", &list, &data)
+                    FwType::NfTables => firewall::nft_add(&list, &data)
+                }
+                if let Ok(mut state) = state.lock() {
+                    if let Ok(ip) = ip.parse() {
+                        let blocked = Blocked::new(ip, None, timeout as u64);
+                        state.add_blocked(blocked);
+                    }
                 }
                 let _ = kill_connection(&ip);
             }
@@ -492,7 +538,7 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
 }
 
 /// The main function, that reads iptables log and works with IPs
-fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<AtomicU32>, cache: Arc<Mutex<LruCache<String, bool>>>) -> Result<Infallible, io::Error> {
+fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<AtomicU32>, cache: Arc<Mutex<LruCache<String, bool>>>, state: Arc<Mutex<State>>) -> Result<Infallible, io::Error> {
     let f = File::open(&config.pipe_path)?;
     let mut reader = BufReader::new(f);
 
@@ -529,6 +575,12 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
                 if port < 1025 || service_ports.contains(&port) {
                     debug!("{ip} Fast-banning, as scanning port {port}");
                     process_ip(&config, &nats, banned_count, &cache, &block_list, ip);
+                    if let Ok(mut state) = state.lock() {
+                        if let Ok(ip) = ip.parse() {
+                            let blocked = Blocked::new(ip, Some(port), 86400);
+                            state.add_blocked(blocked);
+                        }
+                    }
                     banned.remove(ip);
                 } else {
                     // Sometimes the kernel looses info about legit connections, and some packets are coming as not related to any connections.
@@ -551,6 +603,12 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
                                 if *count >= max_count {
                                     debug!("{ip} Banned for {count} port scans, port {port}");
                                     process_ip(&config, &nats, banned_count, &cache, &block_list, ip);
+                                    if let Ok(mut state) = state.lock() {
+                                        if let Ok(ip) = ip.parse() {
+                                            let blocked = Blocked::new(ip, Some(port), 86400);
+                                            state.add_blocked(blocked);
+                                        }
+                                    }
                                     banned.remove(ip);
                                 }
                             }
@@ -562,12 +620,24 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
                             } else {
                                 debug!("{ip} Banned for first port scan, port {port}");
                                 process_ip(&config, &nats, banned_count, &cache, &block_list, ip);
+                                if let Ok(mut state) = state.lock() {
+                                    if let Ok(ip) = ip.parse() {
+                                        let blocked = Blocked::new(ip, Some(port), 86400);
+                                        state.add_blocked(blocked);
+                                    }
+                                }
                             }
                         }
                     }
                 }
             } else {
                 process_ip(&config, &nats, banned_count, &cache, &block_list, &line);
+                if let Ok(mut state) = state.lock() {
+                    if let Ok(ip) = line.parse() {
+                        let blocked = Blocked::new(ip, None, 86400);
+                        state.add_blocked(blocked);
+                    }
+                }
             }
         } else {
             thread::sleep(delay);
@@ -644,8 +714,10 @@ fn modify_list(fw_type: &FwType, add: bool, nats: &Option<Connection>, list: &st
                     match fw_type {
                         FwType::IpTables => firewall::ipset_add_or_del(action, &list, &ip, comment),
                         FwType::NfTables => {
-                            firewall::nft_add_or_del("delete", &list, &ip);
-                            firewall::nft_add_or_del(action, &list, &ip);
+                            match add {
+                                true => firewall::nft_add(&list, &ip),
+                                false => firewall::nft_del(&list, &ip)
+                            }
                         }
                     }
                     if !tag.is_empty() {
@@ -663,8 +735,10 @@ fn modify_list(fw_type: &FwType, add: bool, nats: &Option<Connection>, list: &st
                     match fw_type {
                         FwType::IpTables => firewall::ipset_add_or_del(action, &list, &ip, comment),
                         FwType::NfTables => {
-                            firewall::nft_add_or_del("delete", &list, &ip);
-                            firewall::nft_add_or_del(action, &list, &ip);
+                            match add {
+                                true => firewall::nft_add(&list, &ip),
+                                false => firewall::nft_del(&list, &ip)
+                            }
                         }
                     }
                     if !tag.is_empty() {
@@ -695,6 +769,7 @@ fn get_options(args: &Vec<String>) -> (Options, Matches) {
     let mut opts = Options::new();
     opts.optflag("h", "help", "Print this help menu");
     opts.optflag("v", "version", "Print version and exit");
+    opts.optflag("i", "interface", "Run user interface to the service");
     opts.optflag("", "install", "Install DisWall as system service (in client mode)");
     opts.optflag("", "update", "Update DisWall to latest release from GitHub");
     opts.optflag("", "after-update", "Perform additional config updates after updating DisWall");

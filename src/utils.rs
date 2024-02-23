@@ -22,6 +22,18 @@ pub fn get_first_part(data: &str) -> String {
     return data.to_owned();
 }
 
+pub fn get_ip_and_timeout(data: &str) -> (String, String) {
+    if data.contains(" ") {
+        let parts = data.trim().split(" ").collect::<Vec<_>>();
+        return if parts.len() == 3 {
+            (parts[0].to_owned(), parts[2].to_owned())
+        } else {
+            (parts[0].to_owned(), String::new())
+        }
+    }
+    return (data.to_owned(), String::new());
+}
+
 /// If the string has "|", then it returns first part as IP, and second as Tag.
 /// Otherwise it returns whole string as IP, and empty string as Tag.
 pub fn get_ip_and_tag(data: &str) -> (String, String) {
