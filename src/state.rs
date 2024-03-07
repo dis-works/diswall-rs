@@ -102,6 +102,7 @@ pub struct Blocked {
     pub count: usize
 }
 
+#[allow(dead_code)]
 impl Blocked {
     pub fn new(ip: IpAddr, port: Option<u16>, seconds: u64) -> Self {
         let id = BLOCKED_ID.fetch_add(1, Ordering::SeqCst);
@@ -163,18 +164,9 @@ impl ToString for Blocked {
 }
 
 fn time_to_str(system_time: &SystemTime) -> String {
-    let duration_since_epoch = match system_time.duration_since(std::time::UNIX_EPOCH) {
-        Ok(duration) => duration,
-        Err(_) => Duration::new(0, 0), // Handle potential errors by defaulting to the epoch
-    };
-
+    let duration_since_epoch = system_time.duration_since(std::time::UNIX_EPOCH).unwrap_or_else(|_| Duration::new(0, 0));
     let format = time::format_description::parse_borrowed::<1>("[year]-[month]-[day] [hour]:[minute]:[second]").unwrap();
 
-    //let formatted_time = std::time::UNIX_EPOCH + duration_since_epoch;
     let formatted_time = time::OffsetDateTime::from_unix_timestamp(0).unwrap() + duration_since_epoch;
     formatted_time.format(&format).unwrap()
-    //let d = time::PrimitiveDateTime::format(&format).unwrap();
-    //let formatted_string = formatted_time.format("%Y-%m-%d %H:%M:%S").to_string();
-
-    //formatted_string
 }

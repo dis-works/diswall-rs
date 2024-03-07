@@ -1,4 +1,5 @@
 use std::io::{Read, Write};
+#[cfg(not(windows))]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
 use std::{fs, thread};

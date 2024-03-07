@@ -29,8 +29,11 @@ use crate::install::uninstall_client;
 use crate::install::update_fw_configs_for_ipv6;
 use crate::ports::Ports;
 use crate::state::{Blocked, State};
-use crate::ui::ui_client::UiClient;
-use crate::ui::ui_server::UiServer;
+#[cfg(not(windows))]
+use crate::ui::{
+    ui_client::UiClient,
+    ui_server::UiServer
+};
 
 mod config;
 mod firewall;
@@ -43,9 +46,12 @@ mod addons;
 mod install;
 mod ports;
 mod state;
+#[cfg(not(windows))]
 mod ui;
 
+#[cfg(not(windows))]
 const UI_SOCK_ADDR: &'static str = "/run/diswall.sock";
+const DEFAULT_BLOCK_TIME_SEC: u64 = 86400;
 
 fn main() -> Result<(), i32> {
     let args: Vec<String> = env::args().collect();
@@ -76,6 +82,7 @@ fn main() -> Result<(), i32> {
         return Ok(())
     }
 
+    #[cfg(not(windows))]
     if opt_matches.opt_present("i") {
         setup_logger(&opt_matches);
         info!("Starting DisWall UI...");
@@ -86,15 +93,10 @@ fn main() -> Result<(), i32> {
         return Ok(());
     }
 
-    let file_name = match opt_matches.opt_str("c") {
-        None => String::from("/etc/diswall/diswall.conf"),
-        Some(name) => name
-    };
+    let file_name = opt_matches.opt_str("c").unwrap_or_else(|| String::from("/etc/diswall/diswall.conf"));
+
     // Load or create default config
-    let mut config = match Config::from_file(&file_name) {
-        None => Config::default(),
-        Some(config) => config
-    };
+    let mut config = Config::from_file(&file_name).unwrap_or_else(|| Config::default());
 
     // Override config options by options from arguments
     config.override_config_from_args(&opt_matches);
@@ -269,7 +271,9 @@ fn main() -> Result<(), i32> {
         }
     }
 
+    #[cfg(not(windows))]
     let s = Arc::clone(&state);
+    #[cfg(not(windows))]
     thread::spawn(|| {
         let server = UiServer::new(UI_SOCK_ADDR.to_string(), s);
         server.start();
@@ -355,10 +359,7 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
             let mut buf = String::new();
             for line in string.lines() {
                 let (ip, timeout) = get_ip_and_timeout(&line);
-                let timeout = match timeout.parse::<i64>() {
-                    Ok(t) => t,
-                    Err(_) => 86400
-                };
+                let timeout = timeout.parse::<u64>().unwrap_or_else(|_| DEFAULT_BLOCK_TIME_SEC);
                 let suffix = match is_ipv6(&ip) {
                     true => "6",
                     false => ""
@@ -378,7 +379,7 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
                 if let Ok(mut state) = state.lock() {
                     if let Ok(ip) = ip.parse() {
                         info!("Adding IP {}", &ip);
-                        let blocked = Blocked::new(ip, None, timeout as u64);
+                        let blocked = Blocked::new(ip, None, timeout);
                         state.add_blocked(blocked);
                     } else {
                         error!("Error parsing IP {} from line '{}'", &ip, &line);
@@ -485,9 +486,9 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
                     warn!("Too long tag '{}' from {}", &tag, &string);
                     return Ok(());
                 }
-                let (data, timeout) = match tag.parse::<i64>() {
+                let (data, timeout) = match tag.parse::<u64>() {
                     Ok(timeout) => (format!("{} timeout {}", &ip, timeout), timeout),
-                    Err(_) => (ip.clone(), 86400)
+                    Err(_) => (ip.clone(), DEFAULT_BLOCK_TIME_SEC)
                 };
                 let list = match is_ipv6(&ip) {
                     true => format!("{}6", list_name),
@@ -499,7 +500,7 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
                 }
                 if let Ok(mut state) = state.lock() {
                     if let Ok(ip) = ip.parse() {
-                        let blocked = Blocked::new(ip, None, timeout as u64);
+                        let blocked = Blocked::new(ip, None, timeout);
                         state.add_blocked(blocked);
                     }
                 }
@@ -561,12 +562,12 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
                     continue;
                 }
                 let ip = parts[0];
-                let _protocol = parts[1];
+                let protocol = parts[1];
                 let port = match parts[2].parse::<u16>() {
                     Ok(port) => port,
                     Err(_) => continue
                 };
-                if open_ports.is_open(port) {
+                if open_ports.is_open(port, protocol) {
                     trace!("Skipping open port {port}");
                     line.clear();
                     continue;
@@ -577,7 +578,7 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
                     process_ip(&config, &nats, banned_count, &cache, &block_list, ip);
                     if let Ok(mut state) = state.lock() {
                         if let Ok(ip) = ip.parse() {
-                            let blocked = Blocked::new(ip, Some(port), 86400);
+                            let blocked = Blocked::new(ip, Some(port), DEFAULT_BLOCK_TIME_SEC);
                             state.add_blocked(blocked);
                         }
                     }
@@ -605,7 +606,7 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
                                     process_ip(&config, &nats, banned_count, &cache, &block_list, ip);
                                     if let Ok(mut state) = state.lock() {
                                         if let Ok(ip) = ip.parse() {
-                                            let blocked = Blocked::new(ip, Some(port), 86400);
+                                            let blocked = Blocked::new(ip, Some(port), DEFAULT_BLOCK_TIME_SEC);
                                             state.add_blocked(blocked);
                                         }
                                     }
@@ -622,7 +623,7 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
                                 process_ip(&config, &nats, banned_count, &cache, &block_list, ip);
                                 if let Ok(mut state) = state.lock() {
                                     if let Ok(ip) = ip.parse() {
-                                        let blocked = Blocked::new(ip, Some(port), 86400);
+                                        let blocked = Blocked::new(ip, Some(port), DEFAULT_BLOCK_TIME_SEC);
                                         state.add_blocked(blocked);
                                     }
                                 }
@@ -634,7 +635,7 @@ fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<Ato
                 process_ip(&config, &nats, banned_count, &cache, &block_list, &line);
                 if let Ok(mut state) = state.lock() {
                     if let Ok(ip) = line.parse() {
-                        let blocked = Blocked::new(ip, None, 86400);
+                        let blocked = Blocked::new(ip, None, DEFAULT_BLOCK_TIME_SEC);
                         state.add_blocked(blocked);
                     }
                 }

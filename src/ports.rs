@@ -15,11 +15,10 @@ impl Ports {
         Self { ports: RefCell::new(HashMap::new()), timeout }
     }
 
-    pub fn is_open(&self, port: u16) -> bool {
-        if let Some(instant) = self.ports.borrow().get(&port) {
-            if instant.elapsed().as_secs() < self.timeout {
-                return true;
-            }
+    #[cfg(not(target_os = "freebsd"))]
+    pub fn is_open(&self, port: u16, _protocol: &str) -> bool {
+        if self.is_in_cache(&port) {
+            return true;
         }
 
         let af_flags = AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6;
@@ -46,5 +45,48 @@ impl Ports {
             self.ports.borrow_mut().insert(port, Instant::now());
         }
         listening
+    }
+
+    fn is_in_cache(&self, port: &u16) -> bool {
+        if let Some(instant) = self.ports.borrow().get(&port) {
+            if instant.elapsed().as_secs() < self.timeout {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[cfg(target_os = "freebsd")]
+    fn is_open(&self, port: u16, protocol: &str) -> bool {
+        use std::io::ErrorKind;
+
+        if self.is_in_cache(&port) {
+            return true;
+        }
+
+        match protocol {
+            "TCP" => {
+                // Attempt to create a TCP listener
+                let tcp_listener = std::net::TcpListener::bind(("0.0.0.0", port));
+                if let Err(e) = tcp_listener {
+                    if e.kind() == ErrorKind::AddrInUse {
+                        self.ports.borrow_mut().insert(port, Instant::now());
+                        return true;
+                    }
+                }
+            }
+            "UDP" => {
+                // Attempt to create a UDP socket
+                let udp_socket = std::net::UdpSocket::bind(("0.0.0.0", port));
+                if let Err(e) = udp_socket {
+                    if e.kind() == ErrorKind::AddrInUse {
+                        self.ports.borrow_mut().insert(port, Instant::now());
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        false
     }
 }

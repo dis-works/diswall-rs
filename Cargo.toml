@@ -1,6 +1,6 @@
 [package]
 name = "diswall"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 homepage = "https://diswall.stream"
 repository = "https://github.com/dis-works/diswall-rs"
@@ -18,15 +18,15 @@ toml = "0.8.6"
 json = "0.12.4"
 byteorder = "1.5.0"
 hostname = "^0.3"
-nats = "0.24.0"
-sqlite = "0.32"
+nats = "0.24.1"
+sqlite = "0.33.0"
 time = { version = "0.3.9", features = ["formatting"] }
 rand = "0.8.5"
 ureq = "^2.4"
 lru = "0.12.0"
-nix = { version = "0.27.1", features = ["fs"] }
+nix = { version = "0.28.0", features = ["fs"] }
 netstat2 = "0.9.1"
-ratatui = "0.25.0"
+ratatui = "0.26.1"
 crossterm = "0.27.0"
 
 [profile.release]

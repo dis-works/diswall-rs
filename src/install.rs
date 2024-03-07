@@ -2,7 +2,7 @@ use std::io;
 use std::collections::HashSet;
 use std::process::{Command, Stdio};
 use std::net::SocketAddr;
-use std::io::Read;
+use std::io::{Error, Read};
 use std::str::FromStr;
 #[cfg(not(windows))]
 use std::os::unix::fs::PermissionsExt;
@@ -100,6 +100,10 @@ fn install_rsyslog_config() -> io::Result<()> {
     fs::create_dir_all("/etc/rsyslog.d/")?;
     fs::write(LOG_PATH, include_bytes!("../scripts/10-diswall.conf"))?;
     info!("Created rsyslogd config file: {}", LOG_PATH);
+    restart_rsyslog()
+}
+
+fn restart_rsyslog() -> Result<(), Error> {
     match Command::new("systemctl")
         .arg("restart")
         .arg("rsyslog")
@@ -127,20 +131,7 @@ pub fn update_rsyslog_config() -> io::Result<()> {
     }
     fs::write(LOG_PATH, include_bytes!("../scripts/10-diswall.conf"))?;
     info!("Updated rsyslogd config file: {}", LOG_PATH);
-    match Command::new("systemctl")
-        .arg("restart")
-        .arg("rsyslog")
-        .stdout(Stdio::null()).spawn() {
-        Ok(mut child) => {
-            if let Ok(r) = child.wait() {
-                if r.success() {
-                    info!("Rsyslogd restarted successfully");
-                }
-            }
-        }
-        Err(e) => return Err(e)
-    }
-    Ok(())
+    restart_rsyslog()
 }
 
 fn install_ipt_part() -> io::Result<()> {
@@ -541,19 +532,7 @@ pub(crate) fn uninstall_client() -> io::Result<()> {
     }
 
     fs::remove_file(LOG_PATH)?;
-    match Command::new("systemctl")
-        .arg("restart")
-        .arg("rsyslog")
-        .stdout(Stdio::null()).spawn() {
-        Ok(mut child) => {
-            if let Ok(r) = child.wait() {
-                if r.success() {
-                    info!("Rsyslogd restarted successfully");
-                }
-            }
-        }
-        Err(e) => return Err(e)
-    }
+    let _ = restart_rsyslog();
 
     let _ = fs::remove_file(UNIT_PATH);
     let _ = fs::remove_file(UNIT_IPT_INIT_PATH);

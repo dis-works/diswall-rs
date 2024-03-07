@@ -63,7 +63,7 @@ impl UiClient {
             let start = std::time::Instant::now();
             while let Ok(item) = receiver.try_recv() {
                 state.add_blocked(item);
-                if start.elapsed().as_millis() >= 50 {
+                if start.elapsed().as_millis() >= 500 {
                     break;
                 }
             }
