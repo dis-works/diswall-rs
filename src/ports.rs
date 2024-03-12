@@ -1,10 +1,11 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Instant;
-use netstat2::{AddressFamilyFlags, get_sockets_info, ProtocolFlags, ProtocolSocketInfo};
-use netstat2::TcpState::Listen;
+#[cfg(target_os = "linux")]
+use netstat2::{AddressFamilyFlags, get_sockets_info, ProtocolFlags, ProtocolSocketInfo, TcpState::Listen};
 
 /// A helper to determine what ports we have open, with cache
+#[allow(dead_code)]
 pub struct Ports {
     ports: RefCell<HashMap<u16, Instant>>,
     timeout: u64
@@ -15,7 +16,7 @@ impl Ports {
         Self { ports: RefCell::new(HashMap::new()), timeout }
     }
 
-    #[cfg(not(target_os = "freebsd"))]
+    #[cfg(target_os = "linux")]
     pub fn is_open(&self, port: u16, _protocol: &str) -> bool {
         if self.is_in_cache(&port) {
             return true;
@@ -47,6 +48,7 @@ impl Ports {
         listening
     }
 
+    #[allow(dead_code)]
     fn is_in_cache(&self, port: &u16) -> bool {
         if let Some(instant) = self.ports.borrow().get(&port) {
             if instant.elapsed().as_secs() < self.timeout {
@@ -57,7 +59,7 @@ impl Ports {
     }
 
     #[cfg(target_os = "freebsd")]
-    fn is_open(&self, port: u16, protocol: &str) -> bool {
+    pub fn is_open(&self, port: u16, protocol: &str) -> bool {
         use std::io::ErrorKind;
 
         if self.is_in_cache(&port) {
@@ -87,6 +89,11 @@ impl Ports {
             }
             _ => {}
         }
+        false
+    }
+
+    #[cfg(not(any(target_os = "freebsd", target_os = "linux")))]
+    pub fn is_open(&self, _port: u16, _protocol: &str) -> bool {
         false
     }
 }
