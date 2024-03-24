@@ -60,7 +60,10 @@ pub(crate) fn install_client() -> io::Result<()> {
         info!("Not rewriting pipe at: {}", PIPE_PATH);
     } else {
         fs::create_dir_all("/var/log/diswall")?;
-        mkfifo(PIPE_PATH, stat::Mode::S_IRWXU)?;
+        mkfifo(PIPE_PATH, stat::Mode::S_IRWXU & stat::Mode::S_IRWXG)?;
+        if let Err(e) = change_group_ownership(PIPE_PATH, "syslog") {
+            warn!("Error changing group ownership of {}: {e}", PIPE_PATH);
+        }
         info!("Created firewall pipe: {}", PIPE_PATH);
     }
     // Creating a config for diswall
@@ -84,11 +87,8 @@ pub(crate) fn install_client() -> io::Result<()> {
     }
 
     info!("Installation complete!");
-    match fw_type {
-        FwType::IpTables => info!("Please, read and correct firewall init script at {}, it will run at system start.", IPT_INIT_PATH),
-        FwType::NfTables => info!("Please, read and correct firewall config at {}, it will run at system start.", NFT_CONF_PATH)
-    }
-    info!("Also, check DisWall config at {}, and enter client credentials.", CONFIG_PATH);
+    warn!("IMPORTANT: Read and edit firewall init script by using 'diswall -e', it will run at system start.");
+    warn!("Also, check DisWall config at {}, and enter client credentials.", CONFIG_PATH);
     info!("And then you need to enable & start diswall service by running '(sudo) systemctl enable --now diswall.service'.");
 
     Ok(())
@@ -616,6 +616,20 @@ fn get_listening_services() -> HashSet<Service> {
     }
 
     result
+}
+
+fn change_group_ownership(file_path: &str, group_name: &str) -> Result<(), String> {
+    Command::new("chown")
+        .args(&[format!(":{}", group_name), file_path.to_string()]) // ":group_name" sets the group ownership
+        .output()
+        .map_err(|e| format!("Failed to execute chown command: {}", e))
+        .and_then(|output| {
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(format!("Error executing chown command: {}", String::from_utf8_lossy(&output.stderr)))
+            }
+        })
 }
 
 fn get_last_release() -> Result<Update, String> {
