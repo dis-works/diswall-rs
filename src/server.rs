@@ -16,7 +16,7 @@ use crate::utils::{get_ip_and_tag, is_ipv6};
 pub const DB_NAME: &str = "diswall.db";
 pub const CREATE_DB: &str = include_str!("../data/create_db.sql");
 pub const CHECK_DB: &str = "SELECT name FROM sqlite_master WHERE type='table' AND name='data';";
-pub const TUNE_DB: &str = "pragma temp_store = memory;\npragma mmap_size = 1073741824;";
+pub const TUNE_DB: &str = "PRAGMA temp_store = MEMORY;\nPRAGMA mmap_size = 1073741824;\nPRAGMA synchronous = NORMAL;\nPRAGMA journal_mode = MEMORY;";
 pub const GET_LIST: &str = "SELECT ip, until FROM data WHERE client=? AND hostname=? AND blacklist=? AND until>?;";
 pub const ADD_TO_LIST: &str = "INSERT INTO data (client, hostname, blacklist, ip, until) VALUES (?, ?, ?, ?, ?);";
 pub const COUNT_LIST: &str = "SELECT COUNT(ip) FROM data WHERE client=? AND hostname=? AND blacklist=? AND until>?;";
@@ -137,11 +137,13 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
                     true => (String::new(), String::new(), true),
                     false => (client, hostname, false)
                 };
+                //let t = Instant::now();
                 let timeout = if let Ok(db) = db.lock() {
                     add_to_list(&db, &client, &hostname, true, &ip, None)
                 } else {
                     0
                 };
+                //info!("Added in {} ms", t.elapsed().as_millis());
                 if honeypot {
                     let msg = format!("{}|{}", &ip, cap_timeout(timeout));
                     match nats.publish(&config.nats.bl_global_subject, &msg) {
@@ -157,10 +159,12 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
                     false => ""
                 };
 
+                //let t = Instant::now();
                 let request = format!("INSERT INTO scanners{} VALUES ({}, {}, {}, '{}', '{}')", table_suffix, &client_mix, time, time + timeout, &ip, &tag);
                 send_clickhouse_request(&agent, &config, &request);
                 let request = format!("INSERT INTO nats_data{} (client, hostname, blacklist, ip, until) VALUES ('{}', '{}', {}, '{}', {})", table_suffix, &client, &hostname, 1, &ip, time + timeout);
                 send_clickhouse_request(&agent, &config, &request);
+                //info!("Posted to CH in {} ms", t.elapsed().as_millis());
             }
             Ok(())
         });

@@ -1,14 +1,15 @@
-use std::io::{Read, stdout, Stdout};
+use std::io::{Error, ErrorKind, Read, stdout, Stdout};
 use std::ops::Sub;
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::sync::mpsc::{channel, Sender};
 use std::thread;
 use std::time::{Duration, SystemTime};
 use byteorder::{BigEndian, ReadBytesExt};
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyModifiers};
 use crossterm::ExecutableCommand;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
-use log::{debug, error, trace};
+use log::{debug, error, info, trace};
 use ratatui::layout::Alignment;
 use ratatui::prelude::{Color, Constraint, CrosstermBackend, Direction, Layout, Rect, Style, Stylize};
 use ratatui::Terminal;
@@ -30,7 +31,36 @@ impl UiClient {
     }
 
     pub fn start(&self) -> std::io::Result<()> {
-        let stream = UnixStream::connect(&self.path).expect("Unable to connect to unix-socket");
+        let stream = match Path::new(&self.path).exists() {
+            true => {
+                let mut stream = None;
+                for _ in 0..5 {
+                    info!("Trying to connect to service socket '{}'...", &self.path);
+                    match UnixStream::connect(&self.path) {
+                        Ok(s) => {
+                            info!("Connected!");
+                            stream = Some(s);
+                            break;
+                        },
+                        Err(_) => {
+                            info!("Could not connect to socket, let's wait a bit...");
+                            thread::sleep(Duration::from_secs(3));
+                        }
+                    }
+                }
+                if stream.is_none() {
+                    error!("Could not connect to socket at '{}'. Is diswall service alive?", &self.path);
+                    return Err(Error::from(ErrorKind::NotConnected));
+                }
+                stream
+            }
+            false => {
+                error!("Socket '{}' does not exist. Is diswall service alive?", &self.path);
+                return Err(Error::from(ErrorKind::NotConnected));
+            }
+        };
+
+        let stream = stream.unwrap();
         let (sender, receiver) = channel();
 
         thread::spawn(|| {
@@ -126,6 +156,9 @@ impl UiClient {
                                     } else {
                                         break;
                                     }
+                                },
+                                KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
+                                    break;
                                 },
                                 _ => {},
                             }

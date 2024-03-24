@@ -223,7 +223,7 @@ fn default_pipe() -> String {
 }
 
 fn default_hostname() -> String {
-    get_hostname()
+    get_hostname().replace(".", "_")
 }
 
 fn default_ipset_black_list() -> String {

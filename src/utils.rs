@@ -1,5 +1,7 @@
 use std::net::{IpAddr, Ipv6Addr};
+use std::process::Command;
 use log::{debug, error};
+use crate::config::FwType;
 
 /// Reduces all series of spaces to one space
 pub fn reduce_spaces(string: &str) -> String {
@@ -97,4 +99,20 @@ pub fn replace_string_in_file(filename: &str, find: &str, replace: &str) -> bool
         }
     }
     false
+}
+
+pub fn edit_firewall_config(fw_type: &FwType) {
+    let file = match fw_type {
+        FwType::IpTables => "/usr/bin/diswall_init.sh",
+        FwType::NfTables => "/etc/nftables.conf"
+    };
+    let mut output = Command::new("sensible-editor")
+        .arg(file)
+        .spawn()
+        .expect("Failed to execute editor");
+    let result = output.wait().expect("Failed to execute editor");
+
+    if result.code().is_none() {
+        error!("Editor failed");
+    }
 }

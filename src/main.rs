@@ -23,6 +23,7 @@ use crate::types::Stats;
 use crate::utils::{get_first_part, get_ip_and_tag, get_ip_and_timeout, is_ipv6, reduce_spaces};
 use lru::LruCache;
 use utils::valid_ip;
+use crate::firewall::get_installed_fw_type;
 #[cfg(not(windows))]
 use crate::install::uninstall_client;
 #[cfg(not(windows))]
@@ -73,6 +74,19 @@ fn main() -> Result<(), i32> {
     if opt_matches.opt_present("g") {
         println!("{}", include_str!("../config/diswall.toml"));
         return Ok(());
+    }
+
+    if opt_matches.opt_present("e") {
+        return match get_installed_fw_type() {
+            Ok(fw_type) => {
+                utils::edit_firewall_config(&fw_type);
+                Ok(())
+            },
+            Err(e) => {
+                println!("Could not get current firewall type: {e}");
+                Err(1)
+            }
+        }
     }
 
     if let Some(ip) = opt_matches.opt_str("k") {
@@ -198,6 +212,14 @@ fn main() -> Result<(), i32> {
     let cache = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(8).unwrap())));
     let state = Arc::new(Mutex::new(State::new()));
 
+    #[cfg(not(windows))]
+    let s = Arc::clone(&state);
+    #[cfg(not(windows))]
+    thread::spawn(|| {
+        let server = UiServer::new(UI_SOCK_ADDR.to_string(), s);
+        server.start();
+    });
+
     let nats = if !config.local_only && !config.nats.server.is_empty() {
         //let hostname = config::get_hostname();
         debug!("Connecting to NATS server...");
@@ -270,14 +292,6 @@ fn main() -> Result<(), i32> {
             });
         }
     }
-
-    #[cfg(not(windows))]
-    let s = Arc::clone(&state);
-    #[cfg(not(windows))]
-    thread::spawn(|| {
-        let server = UiServer::new(UI_SOCK_ADDR.to_string(), s);
-        server.start();
-    });
 
     if let Err(e) = lock_on_pipe(config, nats, &banned_count, Arc::clone(&cache), Arc::clone(&state)) {
         error!("Error reading pipe: {}", e);
@@ -777,6 +791,7 @@ fn get_options(args: &Vec<String>) -> (Options, Matches) {
     opts.optflag("", "uninstall", "Uninstall DisWall from your server");
     opts.optflag("d", "debug", "Show trace messages, more than debug");
     opts.optflag("g", "generate", "Generate fresh configuration file. It is better to redirect contents to file.");
+    opts.optflag("e", "edit", "Edit firewall configuration file.");
     opts.optopt("c", "config", "Set configuration file path", "FILE");
     opts.optopt("", "log", "Set log file path", "FILE");
 

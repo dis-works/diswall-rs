@@ -20,6 +20,7 @@ impl UiServer {
     }
 
     pub fn start(&self) {
+        let _ = fs::remove_file(&self.socket_path);
         let listener = match UnixListener::bind(&self.socket_path) {
             Ok(listener) => listener,
             Err(e) => {
@@ -57,7 +58,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<State>>) {
     let mut buffer = [0; 512];
 
     info!("UI client connected");
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
     let mut last_item = 0;
     let mut last_time = std::time::Instant::now();
     loop {
