@@ -220,7 +220,11 @@ fn main() -> Result<(), i32> {
         server.start();
     });
 
-    let nats = if !config.local_only && !config.nats.server.is_empty() {
+    let start_nats = !config.local_only &&
+        !config.nats.server.is_empty() &&
+        !config.nats.client_name.is_empty() &&
+        !config.nats.client_name.eq("<ENTER YOU CLIENT NAME>");
+    let nats = if start_nats {
         //let hostname = config::get_hostname();
         debug!("Connecting to NATS server...");
         let nats = nats::Options::with_user_pass(&config.nats.client_name, &config.nats.client_pass)
@@ -283,12 +287,14 @@ fn main() -> Result<(), i32> {
     }
 
     if !config.nginx.logs.is_empty() {
+        let ignore_ips = Arc::new(config.ignore_ips.clone());
         // For every log path in config we start new thread that will read that log
         for log in &config.nginx.logs {
             let log = log.clone();
             let pipe_path = config.pipe_path.clone();
+            let ignore_ips = Arc::clone(&ignore_ips);
             thread::spawn(move || {
-                addons::nginx::process_log_file(&log, &pipe_path);
+                addons::nginx::process_log_file(&log, &pipe_path, ignore_ips);
             });
         }
     }
@@ -447,12 +453,17 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
             let list_name = config.ipset_black_list.clone();
             let fw_type = config.fw_type.clone();
             let cache = Arc::clone(&cache);
+            let ignore_ips = config.ignore_ips.clone();
             sub.with_handler(move |message| {
                 if let Ok(string) = String::from_utf8(message.data) {
                     //trace!("Got ip from my subject: {}", &string);
                     let (ip, tag) = get_ip_and_tag(&string);
                     if !valid_ip(&ip) {
                         warn!("Could not parse IP {} from {}", &ip, &string);
+                        return Ok(());
+                    }
+                    if ignore_ips.contains(&ip) {
+                        debug!("Ignoring IP {ip}");
                         return Ok(());
                     }
                     if let Ok(cache) = cache.lock() {

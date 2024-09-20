@@ -12,6 +12,8 @@ local_only = false
 server_mode = false
 # Send statistics about dropped packets and dropped bytes to NATS server
 send_statistics = true
+#Ignore some IPs from banning in every situation (these are as an example)
+ignore_ips = ["8.8.8.8", "1.1.1.1"]
 
 # Server mode is able to catch stats from clients and throw them to ClickHouse DB
 [clickhouse]

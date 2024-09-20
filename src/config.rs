@@ -32,7 +32,9 @@ pub struct Config {
     #[serde(default = "default_ipset_black_list")]
     pub ipset_black_list: String,
     #[serde(default = "default_ipset_white_list")]
-    pub ipset_white_list: String
+    pub ipset_white_list: String,
+    #[serde(default)]
+    pub ignore_ips: Vec<String>
 }
 
 impl Config {
@@ -120,6 +122,7 @@ impl Default for Config {
             send_statistics: true,
             ipset_black_list: default_ipset_black_list(),
             ipset_white_list: default_ipset_white_list(),
+            ignore_ips: Vec::new()
         }
     }
 }

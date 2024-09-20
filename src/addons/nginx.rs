@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use log::{debug, error, info, warn};
@@ -10,7 +11,7 @@ const WL: &str = include_str!("whitelist.txt");
 const BL: &str = include_str!("blacklist.txt");
 
 /// Opens an Nginx error log file, parses it line by line and sends IPs of intruders to the specified pipe
-pub fn process_log_file(file_name: &String, pipe_path: &str) {
+pub fn process_log_file(file_name: &String, pipe_path: &str, ignore_ips: Arc<Vec<String>>) {
     let mut file = match File::open(&file_name) {
         Ok(file) => file,
         Err(error) => {
@@ -33,7 +34,7 @@ pub fn process_log_file(file_name: &String, pipe_path: &str) {
             Ok(size) => {
                 if size > 0 {
                     if buffer.ends_with('\n') {
-                        process_log_line(&buffer, &wl, &bl, &mut scores);
+                        process_log_line(&buffer, &wl, &bl, &mut scores, &ignore_ips);
                         let mut gotchas = Vec::new();
                         for (client, score) in &scores {
                             if *score >= 0.7 {
@@ -95,13 +96,17 @@ fn append_to_file(path: &str, content: &str) -> std::io::Result<()> {
 }
 
 /// Process the log line
-fn process_log_line(line: &String, wl: &HashSet<&str>, bl: &HashSet<&str>, scores: &mut HashMap<String, f32>) {
+fn process_log_line(line: &String, wl: &HashSet<&str>, bl: &HashSet<&str>, scores: &mut HashMap<String, f32>, ignore_ips: &Arc<Vec<String>>) {
     let line = LogLine::new(&line);
     match line {
         None => {
             //println!("Line: {}", line.);
         }
         Some(line) => {
+            if ignore_ips.contains(&line.client) {
+                debug!("Ignoring IP {}", &line.client);
+                return;
+            }
             //println!("Line.request: {}, path: {}, client: {}", &line.request, line.get_path(), &line.client);
             let path = line.get_path();
             if wl.contains(&path) {
