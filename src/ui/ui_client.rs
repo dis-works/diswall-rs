@@ -180,7 +180,7 @@ impl UiClient {
                     Constraint::Max(4),
                     Constraint::Min(4),
                 ])
-                .split(frame.size());
+                .split(frame.area());
 
             let b = Block::default()
                 .title(format!(" DisWall v{} ", env!("CARGO_PKG_VERSION")))
@@ -243,10 +243,10 @@ impl UiClient {
             );
             if show_help {
                 let popup_area = Rect {
-                    x: frame.size().width / 4,
-                    y: frame.size().height / 3,
-                    width: frame.size().width / 2,
-                    height: frame.size().height / 3,
+                    x: frame.area().width / 4,
+                    y: frame.area().height / 3,
+                    width: frame.area().width / 2,
+                    height: frame.area().height / 3,
                 };
                 frame.render_widget(help, popup_area);
             }

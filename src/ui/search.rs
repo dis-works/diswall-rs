@@ -55,9 +55,9 @@ impl Search {
     }
 
     pub fn draw(&self, frame: &mut Frame) {
-        let width = frame.size().width / 4;
+        let width = frame.area().width / 4;
         let popup_area = Rect {
-            x: frame.size().width / 2 - width / 2,
+            x: frame.area().width / 2 - width / 2,
             y: 7,
             width,
             height: 3,
@@ -68,12 +68,12 @@ impl Search {
             .style(Style::default())
             .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Magenta)).border_type(BorderType::Rounded).title(" Find "));
         frame.render_widget(input, popup_area);
-        frame.set_cursor(
+        frame.set_cursor_position(
             // Draw the cursor at the current position in the input field.
             // This position is controlled via the left and right arrow keys
-            popup_area.x + self.cursor_pos as u16 + 1,
+            (popup_area.x + self.cursor_pos as u16 + 1,
             // Move one line down, from the border to the input line
-            popup_area.y + 1,
+            popup_area.y + 1)
         )
     }
 
