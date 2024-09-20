@@ -110,6 +110,7 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
         let config = config.clone();
         let agent = agent.clone();
         let subject = config.nats.bl_subscribe_subject.clone();
+        let ignore_ips = config.ignore_ips.clone();
         sub.with_handler(move |message| {
             let (client, hostname) = get_user_and_host(&message.subject);
             debug!("Got message on {} from {:?}", &message.subject, (&client, &hostname));
@@ -118,6 +119,10 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
                 let (ip, mut tag) = get_ip_and_tag(&data);
                 if !utils::valid_ip(&ip) {
                     warn!("Could not parse IP {} from {}", &ip, &client);
+                    return Ok(());
+                }
+                if ignore_ips.contains(&ip) {
+                    debug!("Ignoring IP {ip}");
                     return Ok(());
                 }
                 if tag.len() > 25 {

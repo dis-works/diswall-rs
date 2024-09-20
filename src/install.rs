@@ -61,8 +61,8 @@ pub(crate) fn install_client() -> io::Result<()> {
     } else {
         fs::create_dir_all("/var/log/diswall")?;
         mkfifo(PIPE_PATH, stat::Mode::S_IRWXU & stat::Mode::S_IRWXG)?;
-        if let Err(e) = change_group_ownership(PIPE_PATH, "syslog") {
-            warn!("Error changing group ownership of {}: {e}", PIPE_PATH);
+        if let Err(e) = set_permissions(PIPE_PATH, Permissions::from_mode(0o600)) {
+            warn!("Error changing permissions of {}: {e}", PIPE_PATH);
         }
         info!("Created firewall pipe: {}", PIPE_PATH);
     }
@@ -616,20 +616,6 @@ fn get_listening_services() -> HashSet<Service> {
     }
 
     result
-}
-
-fn change_group_ownership(file_path: &str, group_name: &str) -> Result<(), String> {
-    Command::new("chown")
-        .args(&[format!(":{}", group_name), file_path.to_string()]) // ":group_name" sets the group ownership
-        .output()
-        .map_err(|e| format!("Failed to execute chown command: {}", e))
-        .and_then(|output| {
-            if output.status.success() {
-                Ok(())
-            } else {
-                Err(format!("Error executing chown command: {}", String::from_utf8_lossy(&output.stderr)))
-            }
-        })
 }
 
 fn get_last_release() -> Result<Update, String> {
