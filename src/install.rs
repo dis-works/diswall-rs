@@ -7,6 +7,7 @@ use std::str::FromStr;
 #[cfg(not(windows))]
 use std::os::unix::fs::PermissionsExt;
 use std::fs::{File, Permissions, set_permissions};
+use std::path::Path;
 use serde::Deserialize;
 use log::{error, info, warn};
 #[cfg(not(windows))]
@@ -42,12 +43,6 @@ pub(crate) fn install_client() -> io::Result<()> {
         }
     };
 
-    // Configuring rsyslog
-    if Path::new(LOG_PATH).exists() {
-        info!("Not rewriting rsyslogd config file at: {}", LOG_PATH);
-    } else {
-        install_rsyslog_config()?;
-    }
     // Adding systemd service for diswall
     if Path::new(UNIT_PATH).exists() {
         info!("Not rewriting service file: {}", UNIT_PATH);
@@ -94,12 +89,12 @@ pub(crate) fn install_client() -> io::Result<()> {
     Ok(())
 }
 
-fn install_rsyslog_config() -> io::Result<()> {
+fn remove_rsyslog_config() -> io::Result<()> {
     use std::fs;
 
-    fs::create_dir_all("/etc/rsyslog.d/")?;
-    fs::write(LOG_PATH, include_bytes!("../scripts/10-diswall.conf"))?;
-    info!("Created rsyslogd config file: {}", LOG_PATH);
+    fs::remove_file(LOG_PATH)?;
+    let _ = fs::remove_file("/etc/rsyslog.d/20-diswall-ssh.conf");
+    info!("Removed old rsyslogd config files");
     restart_rsyslog()
 }
 
@@ -118,20 +113,6 @@ fn restart_rsyslog() -> Result<(), Error> {
         Err(e) => return Err(e)
     }
     Ok(())
-}
-
-pub fn update_rsyslog_config() -> io::Result<()> {
-    use std::fs;
-
-    fs::create_dir_all("/etc/rsyslog.d/")?;
-    if let Ok(text) = fs::read_to_string(LOG_PATH) {
-        if text.contains("PROTO=([A-Za-z0-9]+)") {
-            return Ok(());
-        }
-    }
-    fs::write(LOG_PATH, include_bytes!("../scripts/10-diswall.conf"))?;
-    info!("Updated rsyslogd config file: {}", LOG_PATH);
-    restart_rsyslog()
 }
 
 fn install_ipt_part() -> io::Result<()> {
@@ -373,7 +354,6 @@ pub(crate) fn update_client() -> io::Result<()> {
                             if let Ok(r) = child.wait() {
                                 if r.success() {
                                     info!("After update processed successfully");
-                                    return Ok(());
                                 }
                             }
                         }
@@ -456,9 +436,6 @@ pub(crate) fn update_fw_configs_for_ipv6() -> bool {
             }
         }
     }
-    if install_rsyslog_config().is_err() {
-        return false;
-    }
     true
 }
 
@@ -495,6 +472,20 @@ pub(crate) fn update_fw_configs_for_separated_protocols() -> bool {
         }
     }
     true
+}
+
+/// Now we dropped usage of rsyslog, we use journald, so we remove our old configs
+pub(crate) fn uninstall_rsyslog_configs() -> bool {
+    // Deconfiguring rsyslog
+    if Path::new(LOG_PATH).exists() {
+        info!("Removing old rsyslog config files, they are not needed anymore.");
+        if let Err(e) = remove_rsyslog_config() {
+            error!("Error removing rsyslog configs: {e}");
+        }
+        // We return true meaning there was an attempt of removing old configs
+        return true;
+    }
+    false
 }
 
 #[cfg(not(windows))]

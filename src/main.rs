@@ -1,8 +1,7 @@
-use std::convert::Infallible;
 use std::{env, io, thread};
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
 use std::net::IpAddr;
 use std::num::{NonZeroUsize};
 use std::process::{Command, exit, Stdio};
@@ -116,7 +115,7 @@ fn main() -> Result<(), i32> {
     config.override_config_from_args(&opt_matches);
     config.init_nats_subjects();
     setup_logger(&opt_matches);
-    match firewall::get_installed_fw_type() {
+    match get_installed_fw_type() {
         Ok(t) => config.fw_type = t,
         Err(e) => {
             error!("{}", e);
@@ -137,6 +136,11 @@ fn main() -> Result<(), i32> {
         #[cfg(not(windows))]
         if install::update_fw_configs_for_separated_protocols() {
             info!("Firewall config updated");
+        }
+        #[cfg(not(windows))]
+        if install::uninstall_rsyslog_configs() {
+            // We restart service only for old update code in `install::update_client()`.
+            // TODO: This code will be removed in next version
             match Command::new("systemctl").arg("restart").arg("diswall").stdout(Stdio::null()).spawn() {
                 Ok(mut child) => {
                     if let Ok(r) = child.wait() {
@@ -201,11 +205,6 @@ fn main() -> Result<(), i32> {
             }
             return Ok(());
         }
-    }
-
-    #[cfg(not(windows))]
-    if let Err(e) = crate::install::update_rsyslog_config() {
-        error!("Error updating rsyslog config: {e}");
     }
 
     debug!("Loaded config:\n{:#?}", &config);
@@ -299,8 +298,8 @@ fn main() -> Result<(), i32> {
         }
     }
 
-    if let Err(e) = lock_on_pipe(config, nats, &banned_count, Arc::clone(&cache), Arc::clone(&state)) {
-        error!("Error reading pipe: {}", e);
+    if let Err(e) = lock_on_log_read(config, nats, &banned_count, Arc::clone(&cache), Arc::clone(&state)) {
+        error!("Error reading journalctl: {}", e);
     }
     Ok(())
 }
@@ -563,112 +562,148 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
     }
 }
 
-/// The main function, that reads iptables log and works with IPs
-fn lock_on_pipe(config: Config, nats: Option<Connection>, banned_count: &Arc<AtomicU32>, cache: Arc<Mutex<LruCache<String, bool>>>, state: Arc<Mutex<State>>) -> Result<Infallible, io::Error> {
-    let f = File::open(&config.pipe_path)?;
-    let mut reader = BufReader::new(f);
-
-    debug!("Pipe opened, waiting for IPs");
-    let block_list = config.ipset_black_list.as_str();
-    let mut line = String::new();
-    let delay = Duration::from_millis(2);
-    let mut banned = HashMap::<String, (Instant, i32)>::new();
-    // Usual scanned ports of known services like databases, etc.
-    let service_ports = [1025, 1433, 1434, 1521, 1583, 1830, 2049, 3050, 3306, 3351, 3389, 5432, 5900, 6379, 7210, 8080, 8081, 8443, 9200, 9216, 9300, 11211];
-    const EPHEMERAL_PORT_START: u16 = 49152;
-    let open_ports = Ports::new(60);
-    loop {
-        let len = reader.read_line(&mut line)?;
-        if len > 0 {
-            trace!("Got line: {line}");
-            if line.contains(' ') {
-                let parts = line.trim().split(' ').collect::<Vec<_>>();
-                if parts.len() != 3 {
-                    continue;
+fn lock_on_log_read(config: Config, nats: Option<Connection>, banned_count: &Arc<AtomicU32>, cache: Arc<Mutex<LruCache<String, bool>>>, state: Arc<Mutex<State>>) -> Result<(), io::Error> {
+    match Command::new("journalctl")
+        .arg("-f")
+        .arg("--since=now")
+        .arg("--output=cat")
+        .arg("--grep=diswall-log|sshd:auth")
+        .stdout(Stdio::piped()).spawn() {
+        Ok(mut child) => {
+            match child.stdout.take() {
+                None => {
+                    error!("Error starting journalctl");
+                    return Err(io::Error::from(ErrorKind::NotFound));
                 }
-                let ip = parts[0];
-                let protocol = parts[1];
-                let port = match parts[2].parse::<u16>() {
-                    Ok(port) => port,
-                    Err(_) => continue
-                };
-                if open_ports.is_open(port, protocol) {
-                    trace!("Skipping open port {port}");
-                    line.clear();
-                    continue;
-                }
-                // If the packet is going to sensitive port, we ban it no matter what
-                if port < 1025 || service_ports.contains(&port) {
-                    debug!("{ip} Fast-banning, as scanning port {port}");
-                    process_ip(&config, &nats, banned_count, &cache, &block_list, ip);
-                    if let Ok(mut state) = state.lock() {
-                        if let Ok(ip) = ip.parse() {
-                            let blocked = Blocked::new(ip, Some(port), DEFAULT_BLOCK_TIME_SEC);
-                            state.add_blocked(blocked);
-                        }
-                    }
-                    banned.remove(ip);
-                } else {
-                    // Sometimes the kernel looses info about legit connections, and some packets are coming as not related to any connections.
-                    // For these packets we are trying to count those packets, and don't ban on random glitch-packet.
-                    match banned.get_mut(ip) {
-                        Some((time, count)) => {
-                            // For ephemeral ports we use more relaxed blocking
-                            let max_count = if port >= EPHEMERAL_PORT_START {
-                                3
-                            } else {
-                                1
-                            };
-                            if time.elapsed().as_secs() > 3600 {
-                                *count = 1;
-                                *time = Instant::now();
-                                debug!("{ip} Resetting count to {count}, port {port}");
-                            } else {
-                                *count += 1;
-                                debug!("{ip} Incremented count to {count}, port {port}");
-                                if *count >= max_count {
-                                    debug!("{ip} Banned for {count} port scans, port {port}");
-                                    process_ip(&config, &nats, banned_count, &cache, &block_list, ip);
+                Some(out) => {
+                    let mut reader = BufReader::new(out);
+                    debug!("Pipe opened, waiting for IPs");
+                    let block_list = config.ipset_black_list.as_str();
+                    let mut line = String::new();
+                    let delay = Duration::from_millis(2);
+                    let mut banned = HashMap::<String, (Instant, i32)>::new();
+                    // Usual scanned ports of known services like databases, etc.
+                    let service_ports = [1025, 1433, 1434, 1521, 1583, 1830, 2049, 3050, 3306, 3351, 3389, 5432, 5900, 6379, 7210, 8080, 8081, 8443, 9200, 9216, 9300, 11211];
+                    const EPHEMERAL_PORT_START: u16 = 49152;
+                    let open_ports = Ports::new(60);
+                    loop {
+                        let len = reader.read_line(&mut line)?;
+                        if len > 0 {
+                            //trace!("Got line: {line}");
+                            if line.starts_with("diswall-log") {
+                                trace!("Got line from firewall");
+                                let mut ip = String::new();
+                                let mut protocol = String::new();
+                                let mut port = 0u16;
+                                let parts = line.trim().split(' ').collect::<Vec<_>>();
+                                for part in parts {
+                                    if part.starts_with("SRC=") {
+                                        ip.push_str(&part[4..]);
+                                        continue;
+                                    }
+                                    if part.starts_with("PROTO=") {
+                                        protocol.push_str(&part[6..]);
+                                        continue;
+                                    }
+                                    if part.starts_with("DPT=") {
+                                        port = part[4..].parse::<u16>().unwrap_or(0);
+                                        break;
+                                    }
+                                }
+                                if open_ports.is_open(port, &protocol) {
+                                    trace!("Skipping open port {port}");
+                                    line.clear();
+                                    continue;
+                                }
+                                // If the packet is going to sensitive port, we ban it no matter what
+                                if port < 1025 || service_ports.contains(&port) {
+                                    debug!("{ip} Fast-banning, as scanning port {port}");
+                                    process_ip(&config, &nats, banned_count, &cache, &block_list, &ip);
                                     if let Ok(mut state) = state.lock() {
                                         if let Ok(ip) = ip.parse() {
                                             let blocked = Blocked::new(ip, Some(port), DEFAULT_BLOCK_TIME_SEC);
                                             state.add_blocked(blocked);
                                         }
                                     }
-                                    banned.remove(ip);
+                                    banned.remove(&ip);
+                                } else {
+                                    // Sometimes the kernel looses info about legit connections, and some packets are coming as not related to any connections.
+                                    // For these packets we are trying to count those packets, and don't ban on random glitch-packet.
+                                    match banned.get_mut(&ip) {
+                                        Some((time, count)) => {
+                                            // For ephemeral ports we use more relaxed blocking
+                                            let max_count = if port >= EPHEMERAL_PORT_START {
+                                                3
+                                            } else {
+                                                1
+                                            };
+                                            if time.elapsed().as_secs() > 3600 {
+                                                *count = 1;
+                                                *time = Instant::now();
+                                                debug!("{ip} Resetting count to {count}, port {port}");
+                                            } else {
+                                                *count += 1;
+                                                debug!("{ip} Incremented count to {count}, port {port}");
+                                                if *count >= max_count {
+                                                    debug!("{ip} Banned for {count} port scans, port {port}");
+                                                    process_ip(&config, &nats, banned_count, &cache, &block_list, &ip);
+                                                    if let Ok(mut state) = state.lock() {
+                                                        if let Ok(ip) = ip.parse() {
+                                                            let blocked = Blocked::new(ip, Some(port), DEFAULT_BLOCK_TIME_SEC);
+                                                            state.add_blocked(blocked);
+                                                        }
+                                                    }
+                                                    banned.remove(&ip);
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            if port >= EPHEMERAL_PORT_START {
+                                                debug!("{ip} First attempt of port {port} scan, saving");
+                                                banned.insert(ip.to_owned(), (Instant::now(), 1));
+                                            } else {
+                                                debug!("{ip} Banned for first port scan, port {port}");
+                                                process_ip(&config, &nats, banned_count, &cache, &block_list, &ip);
+                                                if let Ok(mut state) = state.lock() {
+                                                    if let Ok(ip) = ip.parse() {
+                                                        let blocked = Blocked::new(ip, Some(port), DEFAULT_BLOCK_TIME_SEC);
+                                                        state.add_blocked(blocked);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
-                            }
-                        }
-                        None => {
-                            if port >= EPHEMERAL_PORT_START {
-                                debug!("{ip} First attempt of port {port} scan, saving");
-                                banned.insert(ip.to_owned(), (Instant::now(), 1));
-                            } else {
-                                debug!("{ip} Banned for first port scan, port {port}");
-                                process_ip(&config, &nats, banned_count, &cache, &block_list, ip);
-                                if let Ok(mut state) = state.lock() {
-                                    if let Ok(ip) = ip.parse() {
-                                        let blocked = Blocked::new(ip, Some(port), DEFAULT_BLOCK_TIME_SEC);
-                                        state.add_blocked(blocked);
+                            } else if line.contains("sshd:auth") && line.contains("authentication failure") {
+                                trace!("Got line from sshd: {}", line.replace("sshd", "****"));
+                                if let Some(mut pos) = line.find("rhost=") {
+                                    pos += 6;
+                                    trace!("slicing from {}", &line[pos..]);
+                                    let pos2 = match line[pos..].find(' ') {
+                                        Some(pos2) => pos+pos2,
+                                        None => line.len()
+                                    };
+                                    let ip = line[pos..pos2].trim().to_string();
+                                    let ban = format!("{}|ssh", &ip);
+                                    trace!("Banning {ip}");
+                                    process_ip(&config, &nats, banned_count, &cache, &block_list, &ban);
+                                    if let Ok(mut state) = state.lock() {
+                                        if let Ok(ip) = ip.parse() {
+                                            let blocked = Blocked::new(ip, None, DEFAULT_BLOCK_TIME_SEC);
+                                            state.add_blocked(blocked);
+                                        }
                                     }
                                 }
                             }
+                        } else {
+                            thread::sleep(delay);
                         }
-                    }
-                }
-            } else {
-                process_ip(&config, &nats, banned_count, &cache, &block_list, &line);
-                if let Ok(mut state) = state.lock() {
-                    if let Ok(ip) = line.parse() {
-                        let blocked = Blocked::new(ip, None, DEFAULT_BLOCK_TIME_SEC);
-                        state.add_blocked(blocked);
+                        line.clear();
                     }
                 }
             }
-        } else {
-            thread::sleep(delay);
         }
-        line.clear();
+        Err(e) => return Err(e)
     }
 }
 
