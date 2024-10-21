@@ -4,8 +4,8 @@ use getopts::Matches;
 use log::{error, warn};
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_CLIENT_NAME: &'static str = "<ENTER YOU CLIENT NAME>";
-const DEFAULT_CLIENT_PASS: &'static str = "<ENTER YOUR PASSWORD>";
+pub const DEFAULT_CLIENT_NAME: &'static str = "default";
+const DEFAULT_CLIENT_PASS: &'static str = "default";
 pub(crate) const PREFIX_WL: &'static str = "diswall.whitelist";
 pub(crate) const PREFIX_BL: &'static str = "diswall.blacklist";
 pub(crate) const PREFIX_STATS: &'static str = "diswall.stats";
@@ -13,8 +13,6 @@ pub(crate) const PREFIX_STATS: &'static str = "diswall.stats";
 /// The main configuration structure, loaded from TOML config file
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
-    #[serde(default = "default_pipe")]
-    pub pipe_path: String,
     #[serde(default)]
     pub nginx: Nginx,
     #[serde(default)]
@@ -56,9 +54,6 @@ impl Config {
     }
 
     pub fn override_config_from_args(&mut self, opt_matches: &Matches) {
-        if let Some(name) = opt_matches.opt_str("f") {
-            self.pipe_path = name;
-        }
         if let Some(server) = opt_matches.opt_str("s") {
             self.nats.server = server;
         }
@@ -86,7 +81,7 @@ impl Config {
     }
 
     pub fn init_nats_subjects(&mut self) {
-        if !self.local_only && self.nats.client_name.ne(DEFAULT_CLIENT_NAME) {
+        if !self.local_only {
             let (client, host) = match self.server_mode {
                 true => ("*", "*"),
                 false => (self.nats.client_name.as_str(), self.nats.hostname.as_str())
@@ -104,6 +99,9 @@ impl Config {
 
             self.nats.stats_subject = format!("{}.{}.add.{}", PREFIX_STATS, client, host);
         }
+        if self.nats.client_name == DEFAULT_CLIENT_NAME {
+            self.nats.bl_global_subject = format!("{}.default", PREFIX_BL);
+        }
     }
 }
 
@@ -112,7 +110,6 @@ impl Default for Config {
         let nats = NatsConfig::default();
         let clickhouse = ClickHouseConfig::default();
         Config {
-            pipe_path: default_pipe(),
             nginx: Nginx::default(),
             nats,
             fw_type: FwType::IpTables,
@@ -219,10 +216,6 @@ pub fn get_hostname() -> String {
             unknown
         }
     }
-}
-
-fn default_pipe() -> String {
-    String::from("/var/log/diswall/diswall.pipe")
 }
 
 fn default_hostname() -> String {

@@ -1,6 +1,4 @@
-use std::fs::File;
 use std::hash::Hasher;
-use std::io::{BufRead, BufReader};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -10,7 +8,7 @@ use sqlite::State;
 use time::OffsetDateTime;
 use ureq::Agent;
 use crate::{Config, Stats, utils};
-use crate::config::{PREFIX_BL, PREFIX_STATS, PREFIX_WL};
+use crate::config::{DEFAULT_CLIENT_NAME, PREFIX_BL, PREFIX_STATS, PREFIX_WL};
 use crate::utils::{get_ip_and_tag, is_ipv6};
 
 pub const DB_NAME: &str = "diswall.db";
@@ -111,6 +109,7 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
         let agent = agent.clone();
         let subject = config.nats.bl_subscribe_subject.clone();
         let ignore_ips = config.ignore_ips.clone();
+        let default_channel = format!("{}.{}", PREFIX_BL, DEFAULT_CLIENT_NAME);
         sub.with_handler(move |message| {
             let (client, hostname) = get_user_and_host(&message.subject);
             debug!("Got message on {} from {:?}", &message.subject, (&client, &hostname));
@@ -142,18 +141,25 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
                     true => (String::new(), String::new(), true),
                     false => (client, hostname, false)
                 };
-                //let t = Instant::now();
                 let timeout = if let Ok(db) = db.lock() {
                     add_to_list(&db, &client, &hostname, true, &ip, None)
                 } else {
                     0
                 };
-                //info!("Added in {} ms", t.elapsed().as_millis());
+
                 if honeypot {
-                    let msg = format!("{}|{}", &ip, cap_timeout(timeout));
+                    let capped = cap_timeout(timeout);
+                    let msg = format!("{}|{}", &ip, capped);
                     match nats.publish(&config.nats.bl_global_subject, &msg) {
                         Ok(_) => info!("Pushed {} to [{}]", &msg, &config.nats.bl_global_subject),
                         Err(e) => warn!("Error pushing {} to [{}]: {}", &msg, &config.nats.bl_global_subject, e)
+                    }
+                    // Send only long bans for default (not registered) users
+                    if capped > DEFAULT_TIMEOUT {
+                        match nats.publish(&default_channel, &msg) {
+                            Ok(_) => info!("Pushed {} to [{}]", &msg, &default_channel),
+                            Err(e) => warn!("Error pushing {} to [{}]: {}", &msg, &default_channel, e)
+                        }
                     }
                 } else {
                     // We push tag only from honeypots
@@ -163,13 +169,10 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
                     true => "6",
                     false => ""
                 };
-
-                //let t = Instant::now();
                 let request = format!("INSERT INTO scanners{} VALUES ({}, {}, {}, '{}', '{}')", table_suffix, &client_mix, time, time + timeout, &ip, &tag);
                 send_clickhouse_request(&agent, &config, &request);
                 let request = format!("INSERT INTO nats_data{} (client, hostname, blacklist, ip, until) VALUES ('{}', '{}', {}, '{}', {})", table_suffix, &client, &hostname, 1, &ip, time + timeout);
                 send_clickhouse_request(&agent, &config, &request);
-                //info!("Posted to CH in {} ms", t.elapsed().as_millis());
             }
             Ok(())
         });
@@ -224,65 +227,17 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
         start_stats_handler(&config, nats.clone(), agent);
     }
 
-    // If there is readable pipe to read we read it in a loop
-    if let Ok(f) = File::open(&config.pipe_path) {
-        let mut reader = BufReader::new(f);
-        info!("Pipe opened, waiting for IPs");
-
-        let mut line = String::new();
-        let mut timer = Instant::now();
-        let delay = Duration::from_millis(5);
-        loop {
-            if let Ok(len) = reader.read_line(&mut line) {
-                if len > 0 {
-                    let ip = line.trim().to_owned();
-                    let (ip, timeout) = if ip.contains(" ") {
-                        let parts = ip.split(" ").collect::<Vec<_>>();
-                        (parts[0].to_owned(), Some(parts[1].parse::<i64>().unwrap_or(DEFAULT_TIMEOUT)))
-                    } else {
-                        (ip, None)
-                    };
-                    info!("Got new IP from server pipe: {}", &ip);
-                    if let Ok(db) = db.lock() {
-                        let _ = add_to_list(&db, "", "", true, &ip, timeout);
-                    }
-                    let msg = match timeout {
-                        None => ip,
-                        Some(timeout) => {
-                            let timeout = cap_timeout(timeout);
-                            format!("{}|{}", &ip, timeout)
-                        }
-                    };
-                    match nats.publish(&config.nats.bl_global_subject, &msg) {
-                        Ok(_) => info!("Pushed {} to [{}]", &msg, &config.nats.bl_global_subject),
-                        Err(e) => warn!("Error pushing {} to [{}]: {}", &msg, &config.nats.bl_global_subject, e)
-                    }
-                } else {
-                    thread::sleep(delay);
-                    if timer.elapsed().as_secs() >= 300 {
-                        if let Ok(db) = db.lock() {
-                            let count = count_list(&db, "", "", true);
-                            info!("Currently blocked IP count: {}", count);
-                        }
-                        timer = Instant::now();
-                    }
-                }
+    // We just loop here until we die
+    let delay = Duration::from_secs(1);
+    let mut timer = Instant::now();
+    loop {
+        thread::sleep(delay);
+        if timer.elapsed().as_secs() >= 300 {
+            if let Ok(db) = db.lock() {
+                let count = count_list(&db, "", "", true);
+                info!("Currently blocked IP count: {}", count);
             }
-            line.clear();
-        }
-    } else {
-        // If there is no pipe we just loop here until we die
-        let delay = Duration::from_secs(1);
-        let mut timer = Instant::now();
-        loop {
-            thread::sleep(delay);
-            if timer.elapsed().as_secs() >= 300 {
-                if let Ok(db) = db.lock() {
-                    let count = count_list(&db, "", "", true);
-                    info!("Currently blocked IP count: {}", count);
-                }
-                timer = Instant::now();
-            }
+            timer = Instant::now();
         }
     }
 }
@@ -346,6 +301,7 @@ fn get_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: bo
         true => 1,
         false => 0
     };
+    let registered = client != DEFAULT_CLIENT_NAME;
     match db.prepare(GET_LIST) {
         Ok(mut statement) => {
             statement.bind((1, client)).expect("Error in bind");
@@ -359,8 +315,10 @@ fn get_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: bo
                         result.push('\n');
                     }
                     let timeout = cap_timeout(until - now);
-                    string = format!("{} timeout {}", &string, timeout);
-                    result.push_str(&string);
+                    if registered || timeout >= DEFAULT_TIMEOUT {
+                        string = format!("{} timeout {}", &string, timeout);
+                        result.push_str(&string);
+                    }
                 }
             }
         }

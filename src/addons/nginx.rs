@@ -1,17 +1,23 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
-use std::sync::Arc;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicU32;
 use std::thread;
 use std::time::Duration;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
+use lru::LruCache;
+use nats::Connection;
 use time::PrimitiveDateTime;
+use crate::config::Config;
+use crate::{DEFAULT_BLOCK_TIME_SEC, process_ip};
+use crate::state::{Blocked, State};
 
 const WL: &str = include_str!("whitelist.txt");
 const BL: &str = include_str!("blacklist.txt");
 
 /// Opens an Nginx error log file, parses it line by line and sends IPs of intruders to the specified pipe
-pub fn process_log_file(file_name: &String, pipe_path: &str, ignore_ips: Arc<Vec<String>>) {
+pub fn process_log_file(config: Config, nats: Option<Connection>, banned_count: Arc<AtomicU32>, cache: Arc<Mutex<LruCache<String, bool>>>, state: Arc<Mutex<State>>, file_name: String) {
     let mut file = match File::open(&file_name) {
         Ok(file) => file,
         Err(error) => {
@@ -34,7 +40,7 @@ pub fn process_log_file(file_name: &String, pipe_path: &str, ignore_ips: Arc<Vec
             Ok(size) => {
                 if size > 0 {
                     if buffer.ends_with('\n') {
-                        process_log_line(&buffer, &wl, &bl, &mut scores, &ignore_ips);
+                        process_log_line(&buffer, &wl, &bl, &mut scores, &config.ignore_ips);
                         let mut gotchas = Vec::new();
                         for (client, score) in &scores {
                             if *score >= 0.7 {
@@ -44,8 +50,13 @@ pub fn process_log_file(file_name: &String, pipe_path: &str, ignore_ips: Arc<Vec
                         for client in gotchas {
                             let score = scores.remove(&client).unwrap();
                             debug!("Baning http bot {} -> {:.2}", &client, score);
-                            if let Err(e) = append_to_file(pipe_path, &format!("{}|http\n", &client)) {
-                                warn!("Error writing to DisWall pipe! {}", e);
+                            let ban = format!("{}|http", &client);
+                            process_ip(&config, &nats, &banned_count, &cache, &config.ipset_black_list, &ban);
+                            if let Ok(mut state) = state.lock() {
+                                if let Ok(ip) = client.parse() {
+                                    let blocked = Blocked::new(ip, None, DEFAULT_BLOCK_TIME_SEC);
+                                    state.add_blocked(blocked);
+                                }
                             }
                         }
                     }
@@ -88,15 +99,8 @@ fn get_inode(file: &File) -> u64 {
     0u64
 }
 
-/// Appends a string to a file
-fn append_to_file(path: &str, content: &str) -> std::io::Result<()> {
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    file.write_all(content.as_bytes())?;
-    Ok(())
-}
-
 /// Process the log line
-fn process_log_line(line: &String, wl: &HashSet<&str>, bl: &HashSet<&str>, scores: &mut HashMap<String, f32>, ignore_ips: &Arc<Vec<String>>) {
+fn process_log_line(line: &String, wl: &HashSet<&str>, bl: &HashSet<&str>, scores: &mut HashMap<String, f32>, ignore_ips: &Vec<String>) {
     let line = LogLine::new(&line);
     match line {
         None => {

@@ -1,4 +1,4 @@
-use std::{env, io, thread};
+use std::{env, fs, io, thread};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
@@ -13,7 +13,7 @@ use log::{debug, error, info, LevelFilter, trace, warn};
 use nats::Connection;
 use simplelog::{ColorChoice, CombinedLogger, ConfigBuilder, format_description, LevelPadding, TerminalMode, TermLogger, WriteLogger};
 use time::OffsetDateTime;
-use crate::config::{Config, FwType};
+use crate::config::{Config, DEFAULT_CLIENT_NAME, FwType};
 use crate::server::run_server;
 #[cfg(not(windows))]
 use crate::install::{install_client, update_client};
@@ -119,7 +119,7 @@ fn main() -> Result<(), i32> {
         Ok(t) => config.fw_type = t,
         Err(e) => {
             error!("{}", e);
-            return Err(100);
+            return Err(103);
         }
     }
 
@@ -139,6 +139,7 @@ fn main() -> Result<(), i32> {
         }
         #[cfg(not(windows))]
         if install::uninstall_rsyslog_configs() {
+            let _ = fs::remove_file("/var/log/diswall/diswall.pipe");
             // We restart service only for old update code in `install::update_client()`.
             // TODO: This code will be removed in next version
             match Command::new("systemctl").arg("restart").arg("diswall").stdout(Stdio::null()).spawn() {
@@ -267,7 +268,7 @@ fn main() -> Result<(), i32> {
     }
 
     let banned_count = Arc::new(AtomicU32::new(0));
-    if config.send_statistics {
+    if config.send_statistics && config.nats.client_name.ne(DEFAULT_CLIENT_NAME) {
         if let Some(nats) = nats.clone() {
             let banned_count = banned_count.clone();
             let black_list_name = config.ipset_black_list.clone();
@@ -286,14 +287,16 @@ fn main() -> Result<(), i32> {
     }
 
     if !config.nginx.logs.is_empty() {
-        let ignore_ips = Arc::new(config.ignore_ips.clone());
         // For every log path in config we start new thread that will read that log
         for log in &config.nginx.logs {
             let log = log.clone();
-            let pipe_path = config.pipe_path.clone();
-            let ignore_ips = Arc::clone(&ignore_ips);
+            let state = Arc::clone(&state);
+            let cache = Arc::clone(&cache);
+            let banned_count = banned_count.clone();
+            let nats = nats.clone();
+            let config = config.clone();
             thread::spawn(move || {
-                addons::nginx::process_log_file(&log, &pipe_path, ignore_ips);
+                addons::nginx::process_log_file(config, nats, banned_count, cache, state, log);
             });
         }
     }
@@ -567,7 +570,7 @@ fn lock_on_log_read(config: Config, nats: Option<Connection>, banned_count: &Arc
         .arg("-f")
         .arg("--since=now")
         .arg("--output=cat")
-        .arg("--grep=diswall-log|sshd:auth")
+        .arg("--grep=diswall-log|sshd:auth|diswall-add")
         .stdout(Stdio::piped()).spawn() {
         Ok(mut child) => {
             match child.stdout.take() {
@@ -577,7 +580,7 @@ fn lock_on_log_read(config: Config, nats: Option<Connection>, banned_count: &Arc
                 }
                 Some(out) => {
                     let mut reader = BufReader::new(out);
-                    debug!("Pipe opened, waiting for IPs");
+                    debug!("Journal opened, waiting for IPs");
                     let block_list = config.ipset_black_list.as_str();
                     let mut line = String::new();
                     let delay = Duration::from_millis(2);
@@ -589,9 +592,11 @@ fn lock_on_log_read(config: Config, nats: Option<Connection>, banned_count: &Arc
                     loop {
                         let len = reader.read_line(&mut line)?;
                         if len > 0 {
-                            //trace!("Got line: {line}");
                             if line.starts_with("diswall-log") {
                                 trace!("Got line from firewall");
+                                if line.contains("SRC=0.0.0.0") {
+                                    continue;
+                                }
                                 let mut ip = String::new();
                                 let mut protocol = String::new();
                                 let mut port = 0u16;
@@ -692,6 +697,16 @@ fn lock_on_log_read(config: Config, nats: Option<Connection>, banned_count: &Arc
                                             let blocked = Blocked::new(ip, None, DEFAULT_BLOCK_TIME_SEC);
                                             state.add_blocked(blocked);
                                         }
+                                    }
+                                }
+                            } else if line.contains("diswall-add") {
+                                let line = line.replace("diswall-add ", "");
+                                trace!("Got line from addon {}", &line);
+                                process_ip(&config, &nats, banned_count, &cache, &block_list, &line);
+                                if let Ok(mut state) = state.lock() {
+                                    if let Ok(ip) = line.parse() {
+                                        let blocked = Blocked::new(ip, None, DEFAULT_BLOCK_TIME_SEC);
+                                        state.add_blocked(blocked);
                                     }
                                 }
                             }
@@ -840,8 +855,6 @@ fn get_options(args: &Vec<String>) -> (Options, Matches) {
     opts.optflag("e", "edit", "Edit firewall configuration file.");
     opts.optopt("c", "config", "Set configuration file path", "FILE");
     opts.optopt("", "log", "Set log file path", "FILE");
-
-    opts.optopt("f", "pipe-file", "Named pipe from which to fetch IPs", "FILE");
 
     opts.optopt("s", "nats-server", "NATS server name", "DOMAIN");
     opts.optopt("P", "port", "NATS server port", "PORT");

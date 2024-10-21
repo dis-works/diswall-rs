@@ -10,8 +10,6 @@ use std::fs::{File, Permissions, set_permissions};
 use std::path::Path;
 use serde::Deserialize;
 use log::{error, info, warn};
-#[cfg(not(windows))]
-use nix::unistd::mkfifo;
 use crate::firewall::get_installed_fw_type;
 use crate::utils::replace_string_in_file;
 use crate::{FwType, utils};
@@ -22,7 +20,6 @@ const BIN_PATH: &str = "/usr/bin/diswall";
 const LOG_PATH: &str = "/etc/rsyslog.d/10-diswall.conf";
 const UNIT_PATH: &str = "/etc/systemd/system/diswall.service";
 const UNIT_IPT_INIT_PATH: &str = "/etc/systemd/system/diswall-fw-init.service";
-const PIPE_PATH: &str = "/var/log/diswall/diswall.pipe";
 const CONFIG_PATH: &str = "/etc/diswall/diswall.conf";
 const IPT_INIT_PATH: &str = "/usr/bin/diswall_init.sh";
 const NFT_CONF_PATH: &str = "/etc/nftables.conf";
@@ -32,7 +29,6 @@ const MAX_BIN_SIZE: usize = 10_000_000;
 #[cfg(not(windows))]
 pub(crate) fn install_client() -> io::Result<()> {
     use std::fs;
-    use nix::sys::stat;
     use std::path::Path;
 
     let fw_type = match get_installed_fw_type() {
@@ -49,17 +45,6 @@ pub(crate) fn install_client() -> io::Result<()> {
     } else {
         fs::write(UNIT_PATH, include_bytes!("../scripts/diswall.service"))?;
         info!("Created systemd service file: {}", UNIT_PATH);
-    }
-    // Creating rsyslog->diswall pipe
-    if Path::new(PIPE_PATH).exists() {
-        info!("Not rewriting pipe at: {}", PIPE_PATH);
-    } else {
-        fs::create_dir_all("/var/log/diswall")?;
-        mkfifo(PIPE_PATH, stat::Mode::S_IRWXU & stat::Mode::S_IRWXG)?;
-        if let Err(e) = set_permissions(PIPE_PATH, Permissions::from_mode(0o600)) {
-            warn!("Error changing permissions of {}: {e}", PIPE_PATH);
-        }
-        info!("Created firewall pipe: {}", PIPE_PATH);
     }
     // Creating a config for diswall
     if Path::new(CONFIG_PATH).exists() {
@@ -529,7 +514,6 @@ pub(crate) fn uninstall_client() -> io::Result<()> {
     let _ = fs::remove_file(UNIT_IPT_INIT_PATH);
     let _ = fs::remove_file(CONFIG_PATH);
     let _ = fs::remove_file(IPT_INIT_PATH);
-    let _ = fs::remove_file(PIPE_PATH);
     let _ = fs::remove_file(format!("{}.old", BIN_PATH));
     let _ = fs::remove_file(BIN_PATH);
     info!("Removed all DisWall files");
@@ -553,8 +537,7 @@ fn get_listening_services() -> HashSet<Service> {
                     let buffer = utils::reduce_spaces(&buffer)
                         .trim()
                         .replace("\n\n", "\n")
-                        .replace(" \n", "\n")
-                        .replace("%lo:", ":");
+                        .replace(" \n", "\n");
                     for line in buffer.split("\n") {
                         let parts = line.split(" ").collect::<Vec<_>>();
                         if parts.len() < 6 {
@@ -563,7 +546,12 @@ fn get_listening_services() -> HashSet<Service> {
                         }
 
                         let protocol = String::from(parts[0]);
-                        let dst_addr = parts[4].replace("*:", "0.0.0.0:");
+                        let mut dst_addr = parts[4].replace("*:", "0.0.0.0:");
+                        if dst_addr.contains('%') {
+                            let pos = dst_addr.find('%').unwrap();
+                            let pos2 = dst_addr.rfind(':').unwrap();
+                            dst_addr.replace_range(pos..pos2, "");
+                        }
                         let dst_addr = match SocketAddr::from_str(&dst_addr) {
                             Ok(addr) => addr,
                             Err(e) => {
