@@ -24,6 +24,15 @@ pub fn get_first_part(data: &str) -> String {
     return data.to_owned();
 }
 
+pub fn extract_between_brackets(s: &str) -> Option<String> {
+    if let Some(start) = s.find('[') {
+        if let Some(end) = s.find(']') {
+            return Some(s[start + 1..end].to_string());
+        }
+    }
+    None
+}
+
 pub fn get_ip_and_timeout(data: &str) -> (String, String) {
     if data.contains(" ") {
         let parts = data.trim().split(" ").collect::<Vec<_>>();

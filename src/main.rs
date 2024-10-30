@@ -19,7 +19,7 @@ use crate::server::run_server;
 use crate::install::{install_client, update_client};
 use crate::timer::HourlyTimer;
 use crate::types::Stats;
-use crate::utils::{get_first_part, get_ip_and_tag, get_ip_and_timeout, is_ipv6, reduce_spaces};
+use crate::utils::{extract_between_brackets, get_first_part, get_ip_and_tag, get_ip_and_timeout, is_ipv6, reduce_spaces};
 use lru::LruCache;
 use utils::valid_ip;
 use crate::firewall::get_installed_fw_type;
@@ -570,7 +570,7 @@ fn lock_on_log_read(config: Config, nats: Option<Connection>, banned_count: &Arc
         .arg("-f")
         .arg("--since=now")
         .arg("--output=cat")
-        .arg("--grep=diswall-log|sshd:auth|diswall-add")
+        .arg("--grep=diswall-log|sshd:auth|authentication failed|diswall-add")
         .stdout(Stdio::piped()).spawn() {
         Ok(mut child) => {
             match child.stdout.take() {
@@ -593,8 +593,9 @@ fn lock_on_log_read(config: Config, nats: Option<Connection>, banned_count: &Arc
                         let len = reader.read_line(&mut line)?;
                         if len > 0 {
                             if line.starts_with("diswall-log") {
-                                trace!("Got line from firewall");
+                                trace!("Got line from firewall: {}", line.replace("diswall-log ", ""));
                                 if line.contains("SRC=0.0.0.0") {
+                                    line.clear();
                                     continue;
                                 }
                                 let mut ip = String::new();
@@ -707,6 +708,18 @@ fn lock_on_log_read(config: Config, nats: Option<Connection>, banned_count: &Arc
                                     if let Ok(ip) = line.parse() {
                                         let blocked = Blocked::new(ip, None, DEFAULT_BLOCK_TIME_SEC);
                                         state.add_blocked(blocked);
+                                    }
+                                }
+                            } else if line.contains("authentication failed") && line.contains("SASL") {
+                                trace!("Got line from SASL");
+                                if let Some(ip) = extract_between_brackets(&line) {
+                                    let ban = format!("{ip}|smtp");
+                                    process_ip(&config, &nats, banned_count, &cache, &block_list, &ban);
+                                    if let Ok(mut state) = state.lock() {
+                                        if let Ok(ip) = ip.parse() {
+                                            let blocked = Blocked::new(ip, None, DEFAULT_BLOCK_TIME_SEC);
+                                            state.add_blocked(blocked);
+                                        }
                                     }
                                 }
                             }
