@@ -4,7 +4,7 @@ ipset create -exist diswall-wl hash:net comment
 ipset create -exist diswall-bl hash:ip hashsize 32768 maxelem 1000000 timeout 86400
 
 # Clearing current iptables rules
-iptables -P INPUT ACCEPT
+iptables -P INPUT DROP
 iptables -F INPUT
 
 # Allow all localhost and related connections:

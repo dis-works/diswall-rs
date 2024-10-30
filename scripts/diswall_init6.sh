@@ -5,7 +5,7 @@ ipset create -exist diswall-wl6 hash:net family inet6 comment
 ipset create -exist diswall-bl6 hash:ip family inet6 hashsize 32768 maxelem 1000000 timeout 86400
 
 # Clearing current iptables rules
-ip6tables -P INPUT ACCEPT
+ip6tables -P INPUT DROP
 ip6tables -F INPUT
 
 # Allow all localhost and related connections:
