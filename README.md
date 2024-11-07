@@ -15,20 +15,22 @@ Diswall (distributed firewall) - a client of distributed firewall working on man
 Its purpose - blocking IPs with a blink of the eye on all servers in any infrastructure when some IP checks any of the closed ports of anyone of these servers.
 Therefore, diswall provides good protection of whole infrastructure (as anti-shodan) preventing intruder to get any system information.
 
-The source of these "bad" IP-addresses is iptables log. But it is possible to use other sources in future (for example logs of WAF).
-Thanks to log templates of rsyslog only IP is extracted from kernel, no other info is extracted from logs and is not sent anywhere.
-All acquired IPs are added to a list in ipset and any open connection with that IP is closed (to prevent any interaction with open ports, for example exploitation of web-based vulnerability).
-This IP is simultaneously sent through NATS to the central server (https://diswall.stream) and is distributed to all other diswall clients.
+The source of these "bad" IP-addresses is firewall log. But it is possible to use other sources in future (for example logs of WAF).
+DisWall reads journald messages filtered by special rules, no other info is extracted from logs and is not sent anywhere.
+All acquired IPs are added to a set in nftables or list in ipset and any open connection with that IP is closed (to prevent any interaction with open ports, for example exploitation of web-based vulnerability).
+This IP is simultaneously sent through NATS to the central server ([diswall.stream](https://diswall.stream)) and is distributed to all other diswall clients.
 
 You can use the same approach to distribute allowed IPs as a convenient way to control firewalls on your servers.
 In contrast to blocklist allowlist is unique for every client, it supports comments and can store whole networks.
 
-Every IP that is added to blocklist is stored for a day, but IPs in allowlist are stored indefinitely. Deletion of IPs is also possible.
+Now the banning intervals are variable - we ban for 15 minutes the first time, then 30 minutes, then an hour times scan attempts.
+There are IPs that are banned for several months already.
 
-When your server is started diswall client currently actual block and allow lists.
+When your server is started diswall client gets actual block and allow lists from NATS server.
 This provides protection in accordance with any events that occurred on other servers when any of them was offline.
 
 # ipset
+(If you use obsolete iptables instead of nftables.)
 
 Diswall uses two ipset lists - for blocked addresses (`diswall-bl`) and allowed ones (`diswall-wl`).
 
@@ -37,8 +39,6 @@ It allows usage of whole networks and adding comments for every record.
 
 Block list is created by `ipset create -exist diswall-bl hash:ip hashsize 32768 maxelem 1000000 timeout 86400` command.
 It allows adding only individual IPs and doesn't support comments.
-
-The lifetime of IP in blocklist is 1 day (24 hours). Maximum number of records in blocklist is 1 000 000 (one million), in allowlist - 65 536.
 
 # NATS
 
@@ -56,29 +56,38 @@ But the most important subject is `diswall.blacklist.new` - the server, that is 
 
 The simplest way to install diswall on your server is to use autoinstall functionality in diswall itself:
 ```bash
-curl https://get.diswall.stream | bash
+curl -s https://get.diswall.stream | bash
 ```
 or
 ```bash
-wget -O - https://get.diswall.stream | bash
+wget -q -O - https://get.diswall.stream | bash
 ```
 It will download a short script that will determine your architecture and get the latest appropriate release binary from GitHub.
 Then it will start installation procedure from this binary.
 
 This will copy the binary to `/usr/bin`, create systemd service, diswall config (`/etc/diswall/diswall.conf`)
-and iptables initialization script `/usr/bin/diswall_init.sh`.
-
-Take a look into these files, enter client login and password in first, and add your iptables rules in the second.
+and configure nftables in `/etc/nftables.conf` or add iptables initialization script at `/usr/bin/diswall_init.sh`.
 
 # Configuration
 
-Configuration file is located at `/etc/diswall/diswall.conf`. It's format is TOML.
-Also, you can use command line arguments listed below.
+DisWall configuration file is located at `/etc/diswall/diswall.conf`. Its format is TOML.
+If you register on our website and enter credentials in this config you will get all blocked IPs in a blink of an eye.\
+But you can use DisWall without registration (using 'default/default' credentials). In this case you will not get "fresh" attackers IPs,
+only those known to our DB and have banning period more than 1 day.
+
+As said before the firewall configuration can be either in `/etc/nftables.conf` or `/usr/bin/diswall_init.sh`, depending on firewall installed.\
+But you can edit appropriate file by using simple command `diswall -e`, it will run your preferred editor with appropriate file path.
+
+Also, DisWall has command line arguments listed below.
 
 ```text
 -h, --help                Print this help menu
 -v, --version             Print version and exit
     --install             Install DisWall as system service (in client mode)
+ 	--update              Update DisWall to latest release from GitHub
+	--uninstall           Uninstall DisWall from your server
+-e 	--edit                Edit firewall config
+-i 	--interface           Run text interface to see what's going on
 -d, --debug               Show trace messages, more than debug
 -g, --generate            Generate fresh configuration file. It is better to redirect contents to file.
 -c, --config FILE         Set configuration file path
