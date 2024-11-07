@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use getopts::{Matches, Options};
+use lazy_static::lazy_static;
 use log::{debug, error, info, LevelFilter, trace, warn};
 use nats::Connection;
 use simplelog::{ColorChoice, CombinedLogger, ConfigBuilder, format_description, LevelPadding, TerminalMode, TermLogger, WriteLogger};
@@ -28,7 +29,8 @@ use crate::install::uninstall_client;
 #[cfg(not(windows))]
 use crate::install::update_fw_configs_for_ipv6;
 use crate::ports::Ports;
-use crate::state::{Blocked, State};
+use crate::state::{Blocked, LoginState, State};
+use crate::state::LoginState::LoggedIn;
 #[cfg(not(windows))]
 use crate::ui::{
     ui_client::UiClient,
@@ -52,6 +54,9 @@ mod ui;
 #[cfg(not(windows))]
 const UI_SOCK_ADDR: &'static str = "/run/diswall.sock";
 const DEFAULT_BLOCK_TIME_SEC: u64 = 86400;
+lazy_static! {
+    pub static ref STATE: Arc<Mutex<State>> = Arc::new(Mutex::new(State::new()));
+}
 
 fn main() -> Result<(), i32> {
     let args: Vec<String> = env::args().collect();
@@ -210,13 +215,10 @@ fn main() -> Result<(), i32> {
 
     debug!("Loaded config:\n{:#?}", &config);
     let cache = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(8).unwrap())));
-    let state = Arc::new(Mutex::new(State::new()));
 
     #[cfg(not(windows))]
-    let s = Arc::clone(&state);
-    #[cfg(not(windows))]
     thread::spawn(|| {
-        let server = UiServer::new(UI_SOCK_ADDR.to_string(), s);
+        let server = UiServer::new(UI_SOCK_ADDR.to_string(), Arc::clone(&STATE));
         server.start();
     });
 
@@ -224,14 +226,25 @@ fn main() -> Result<(), i32> {
         !config.nats.server.is_empty() &&
         !config.nats.client_name.is_empty() &&
         !config.nats.client_name.eq("<ENTER YOU CLIENT NAME>");
+    let client_name = config.nats.client_name.clone();
     let nats = if start_nats {
         //let hostname = config::get_hostname();
         debug!("Connecting to NATS server...");
         let nats = nats::Options::with_user_pass(&config.nats.client_name, &config.nats.client_pass)
             .with_name("DisWall")
-            .error_callback(|error| error!("NATS error: {}", error))
+            .error_callback(|error| {
+                error!("NATS error: {}", error);
+                if let Ok(mut state) = STATE.lock() {
+                    state.logged_in = LoginState::Error(error.to_string())
+                }
+            })
             .retry_on_failed_connect()
-            .reconnect_callback(|| info!("Reconnected to NATS server"))
+            .reconnect_callback(move || {
+                info!("Reconnected to NATS server");
+                if let Ok(mut state) = STATE.lock() {
+                    state.logged_in = LoginState::LoggedIn(client_name.clone())
+                }
+            })
             .reconnect_buffer_size(32 * 1024 * 1024)
             .max_reconnects(1_000_000)
             .reconnect_delay_callback(reconnect_timer)
@@ -248,7 +261,14 @@ fn main() -> Result<(), i32> {
                 }
                 if !config.server_mode {
                     info!("Connected to NATS server, setting up handlers");
-                    start_nats_handlers(&mut config, &nats, Arc::clone(&cache), Arc::clone(&state));
+                    if let Ok(mut state) = STATE.lock() {
+                        if config.nats.client_name == DEFAULT_CLIENT_NAME {
+                            state.logged_in = LoginState::Default;
+                        } else {
+                            state.logged_in = LoggedIn(config.nats.client_name.clone());
+                        }
+                    }
+                    start_nats_handlers(&mut config, &nats, Arc::clone(&cache), Arc::clone(&STATE));
                 }
                 Some(nats)
             }
@@ -290,7 +310,7 @@ fn main() -> Result<(), i32> {
         // For every log path in config we start new thread that will read that log
         for log in &config.nginx.logs {
             let log = log.clone();
-            let state = Arc::clone(&state);
+            let state = Arc::clone(&STATE);
             let cache = Arc::clone(&cache);
             let banned_count = banned_count.clone();
             let nats = nats.clone();
@@ -301,7 +321,7 @@ fn main() -> Result<(), i32> {
         }
     }
 
-    if let Err(e) = lock_on_log_read(config, nats, &banned_count, Arc::clone(&cache), Arc::clone(&state)) {
+    if let Err(e) = lock_on_log_read(config, nats, &banned_count, Arc::clone(&cache), Arc::clone(&STATE)) {
         error!("Error reading journalctl: {}", e);
     }
     Ok(())

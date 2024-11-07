@@ -4,7 +4,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::mpsc::{channel, Sender};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use byteorder::{BigEndian, ReadBytesExt};
 use crossterm::event::{KeyCode, KeyModifiers};
 use crossterm::ExecutableCommand;
@@ -13,9 +13,9 @@ use log::{debug, error, info, trace};
 use ratatui::layout::Alignment;
 use ratatui::prelude::{Color, Constraint, CrosstermBackend, Direction, Layout, Rect, Style, Stylize};
 use ratatui::Terminal;
+use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, BorderType, Paragraph};
-use ratatui::widgets::block::{Position, Title};
-use crate::state::{Blocked, State};
+use crate::state::{Blocked, LoginState, State};
 use crate::ui::help::Popup;
 use crate::ui::messages::StateMessage;
 use crate::ui::search::Search;
@@ -61,7 +61,7 @@ impl UiClient {
         };
 
         let stream = stream.unwrap();
-        let (sender, receiver) = channel();
+        let (sender, receiver) = channel::<ClientMessage>();
 
         thread::spawn(|| {
             if let Err(e) = read_stream(stream, sender) {
@@ -87,19 +87,31 @@ impl UiClient {
         let mut show_help = false;
         let mut search = Search::new();
         let mut found: Option<String> = None;
+        let mut last_redraw = std::time::Instant::now();
 
         loop {
             let version = state.get_version();
             let start = std::time::Instant::now();
             while let Ok(item) = receiver.try_recv() {
-                state.add_blocked(item);
+                match item {
+                    ClientMessage::BlockedItem(item) => state.add_blocked(item),
+                    ClientMessage::LoginState(new_state) => {
+                        state.logged_in = new_state;
+                        redraw = true;
+                    }
+                }
                 if start.elapsed().as_millis() >= 500 {
                     break;
                 }
             }
 
+            if !redraw && last_redraw.elapsed().as_millis() >= 500 {
+                redraw = true;
+            }
+
             if redraw || version != state.get_version() {
                 Self::redraw(&mut terminal, &state, &state_time, &origin, help.clone(), show_help, &search, &found)?;
+                last_redraw = Instant::now();
                 redraw = false;
             }
 
@@ -182,8 +194,16 @@ impl UiClient {
                 ])
                 .split(frame.area());
 
+            let (text, style) = match &state.logged_in {
+                LoginState::Unknown => (String::from(" Status unknown "), Style::from(Color::Gray)),
+                LoginState::Error(e) => (format!(" Error: {e} "), Style::from(Color::Red)),
+                LoginState::LoggedIn(login) => (format!(" Connected as: {login} "), Style::from(Color::White).bg(Color::Green)),
+                LoginState::Default => (String::from(" Connected as 'default' (restricted account) "), Style::from(Color::Black).bg(Color::LightYellow))
+            };
+
             let b = Block::default()
                 .title(format!(" DisWall v{} ", env!("CARGO_PKG_VERSION")))
+                .title_top(Line::from(text).style(style).alignment(Alignment::Right))
                 .border_style(Style::default().fg(Color::Magenta))
                 .border_type(BorderType::Rounded)
                 .borders(Borders::ALL);
@@ -237,7 +257,7 @@ impl UiClient {
                             .border_style(Style::default().fg(Color::Magenta))
                             .border_type(BorderType::Rounded)
                             .borders(Borders::ALL)
-                            .title(Title::from(bottom).position(Position::Bottom).alignment(Alignment::Center))
+                            .title_bottom(Line::from(bottom).centered())
                     ),
                 layout[1],
             );
@@ -258,7 +278,7 @@ impl UiClient {
     }
 }
 
-fn read_stream(mut stream: UnixStream, sender: Sender<Blocked>) -> std::io::Result<()> {
+fn read_stream(mut stream: UnixStream, sender: Sender<ClientMessage>) -> std::io::Result<()> {
     loop {
         //TODO read message size
         let message_size = match stream.read_u64::<BigEndian>() {
@@ -309,10 +329,14 @@ fn read_stream(mut stream: UnixStream, sender: Sender<Blocked>) -> std::io::Resu
                 StateMessage::GetBlocked(_num) => {}
                 StateMessage::Blocked(items) => {
                     for item in items {
-                        //info!("{}", &item.to_string());
-                        if let Err(_) = sender.send(item.clone()) {
+                        if let Err(_) = sender.send(ClientMessage::BlockedItem(item.clone())) {
                             break;
                         }
+                    }
+                }
+                StateMessage::LogStatus(status) => {
+                    if let Err(_) = sender.send(ClientMessage::LoginState(status.clone())) {
+                        break;
                     }
                 }
             }
@@ -393,4 +417,9 @@ pub enum Origin {
     All,
     Global,
     Local
+}
+
+enum ClientMessage {
+    BlockedItem(Blocked),
+    LoginState(LoginState)
 }

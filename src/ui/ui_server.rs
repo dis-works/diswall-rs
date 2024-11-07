@@ -6,7 +6,7 @@ use std::{fs, thread};
 use std::time::Duration;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use log::{debug, error, info};
-use crate::state::State;
+use crate::state::{LoginState, State};
 use crate::ui::messages::StateMessage;
 
 pub struct UiServer {
@@ -61,6 +61,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<State>>) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
     let mut last_item = 0;
     let mut last_time = std::time::Instant::now();
+    let mut last_login_state = LoginState::Unknown;
     loop {
         //TODO read message size
         let message_size = match stream.read_u64::<BigEndian>() {
@@ -97,6 +98,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<State>>) {
                             }
                         }
                         StateMessage::Blocked(_) => {}
+                        StateMessage::LogStatus(_) => {}
                     }
                 }
                 Err(e) => {
@@ -138,6 +140,15 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<State>>) {
             if let Err(e) = stream.flush() {
                 error!("Error flushing socket {e}");
                 break;
+            }
+        }
+        if let Ok(state) = state.lock() {
+            if last_login_state != state.logged_in {
+                let message = StateMessage::LogStatus(state.logged_in.clone());
+                let buf = rmp_serde::encode::to_vec_named(&message).unwrap();
+                stream.write_u64::<BigEndian>(buf.len() as u64).expect("Error sending response");
+                stream.write_all(&buf).expect("Error sending response");
+                last_login_state = state.logged_in.clone();
             }
         }
     }

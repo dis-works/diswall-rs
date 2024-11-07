@@ -13,13 +13,22 @@ pub struct State {
     pub blocked: Vec<Blocked>,
     pub mean: Vec<Blocked>,
     version: u64,
-    mean_version: u64
+    mean_version: u64,
+    pub logged_in: LoginState
+}
+
+#[derive(Clone, Eq, PartialEq, Debug, Deserialize, Serialize)]
+pub enum LoginState {
+    Unknown,
+    LoggedIn(String),
+    Error(String),
+    Default
 }
 
 #[allow(dead_code)]
 impl State {
     pub fn new() -> Self {
-        Self { blocked: Vec::new(), mean: Vec::new(), version: 0, mean_version: 0 }
+        Self { blocked: Vec::new(), mean: Vec::new(), version: 0, mean_version: 0, logged_in: LoginState::Unknown }
     }
 
     pub fn add(&mut self, ip: IpAddr, port: Option<u16>, seconds: u64) {
