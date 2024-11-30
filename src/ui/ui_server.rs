@@ -93,8 +93,9 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<State>>) {
                                 let lines = state.get_blocked(last_item);
                                 let response = StateMessage::Blocked(lines);
                                 let buf = rmp_serde::encode::to_vec_named(&response).unwrap();
-                                stream.write_u64::<BigEndian>(buf.len() as u64).expect("Error sending response");
-                                stream.write_all(&buf).expect("Error sending response");
+                                if let Err(_) = send_message(&mut stream, &buf) {
+                                    break;
+                                }
                             }
                         }
                         StateMessage::Blocked(_) => {}
@@ -123,10 +124,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<State>>) {
             let last = blocked.last().unwrap().id;
             let response = StateMessage::Blocked(blocked);
             let buf = rmp_serde::encode::to_vec_named(&response).unwrap();
-            stream.write_u64::<BigEndian>(buf.len() as u64).expect("Error sending response");
-            stream.write_all(&buf).expect("Error sending response");
-            if let Err(e) = stream.flush() {
-                error!("Error flushing socket {e}");
+            if let Err(_) = send_message(&mut stream, &buf) {
                 break;
             }
             last_item = last;
@@ -134,23 +132,27 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<State>>) {
         } else if last_time.elapsed().as_secs() > 4 {
             let response = StateMessage::Ping;
             let buf = rmp_serde::encode::to_vec_named(&response).unwrap();
-            stream.write_u64::<BigEndian>(buf.len() as u64).expect("Error sending response");
-            stream.write_all(&buf).expect("Error sending response");
-            last_time = std::time::Instant::now();
-            if let Err(e) = stream.flush() {
-                error!("Error flushing socket {e}");
+            if let Err(_) = send_message(&mut stream, &buf) {
                 break;
             }
+            last_time = std::time::Instant::now();
         }
         if let Ok(state) = state.lock() {
             if last_login_state != state.logged_in {
                 let message = StateMessage::LogStatus(state.logged_in.clone());
                 let buf = rmp_serde::encode::to_vec_named(&message).unwrap();
-                stream.write_u64::<BigEndian>(buf.len() as u64).expect("Error sending response");
-                stream.write_all(&buf).expect("Error sending response");
+                if let Err(_) = send_message(&mut stream, &buf) {
+                    break;
+                }
                 last_login_state = state.logged_in.clone();
             }
         }
     }
     info!("UI client disconnected");
+}
+
+fn send_message(stream: &mut UnixStream, buf: &Vec<u8>) -> Result<(), std::io::Error> {
+    stream.write_u64::<BigEndian>(buf.len() as u64)?;
+    stream.write_all(&buf)?;
+    stream.flush()
 }
