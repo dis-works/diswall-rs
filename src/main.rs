@@ -1,4 +1,5 @@
 use std::{env, fs, io, thread};
+use std::cmp::min;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
@@ -397,11 +398,17 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
     // Getting blocklist from server
     match nats.request(&config.nats.bl_init_subject, &msg) {
         Ok(message) => {
+            let default_timeout = if config.max_block_time > 0 {
+                min(DEFAULT_BLOCK_TIME_SEC, config.max_block_time)
+            } else {
+                DEFAULT_BLOCK_TIME_SEC
+            };
             let string = String::from_utf8(message.data).unwrap_or(String::default());
             let mut buf = String::new();
             for line in string.lines() {
                 let (ip, timeout) = get_ip_and_timeout(&line);
                 let timeout = timeout.parse::<u64>().unwrap_or_else(|_| DEFAULT_BLOCK_TIME_SEC);
+                let timeout = min(timeout, default_timeout);
                 let suffix = match is_ipv6(&ip) {
                     true => "6",
                     false => ""
@@ -521,9 +528,10 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
     if let Ok(sub) = nats.subscribe(&config.nats.bl_global_subject) {
         let list_name = config.ipset_black_list.clone();
         let fw_type = config.fw_type.clone();
+        let max_block_time = config.max_block_time;
         sub.with_handler(move |message| {
             if let Ok(string) = String::from_utf8(message.data) {
-                //trace!("Got ip from global subject: {}", &string);
+                trace!("Got ip from global subject: {}", &string);
                 let (ip, tag) = get_ip_and_tag(&string);
                 if !valid_ip(&ip) {
                     warn!("Could not parse IP {} from {}", &ip, &string);
@@ -534,8 +542,22 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
                     return Ok(());
                 }
                 let (data, timeout) = match tag.parse::<u64>() {
-                    Ok(timeout) => (format!("{} timeout {}", &ip, timeout), timeout),
-                    Err(_) => (ip.clone(), DEFAULT_BLOCK_TIME_SEC)
+                    Ok(timeout) => {
+                        let timeout = if max_block_time > 0 {
+                            min(timeout, max_block_time)
+                        } else {
+                            timeout
+                        };
+                        (format!("{} timeout {}", &ip, timeout), timeout)
+                    },
+                    Err(_) => {
+                        let timeout = if max_block_time > 0 {
+                            min(DEFAULT_BLOCK_TIME_SEC, max_block_time)
+                        } else {
+                            DEFAULT_BLOCK_TIME_SEC
+                        };
+                        (ip.clone(), timeout)
+                    }
                 };
                 let list = match is_ipv6(&ip) {
                     true => format!("{}6", list_name),
