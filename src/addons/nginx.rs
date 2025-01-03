@@ -1,14 +1,15 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
-use std::thread;
 use std::time::Duration;
+use async_nats::Client;
 use log::{debug, error, info};
 use lru::LruCache;
-use nats::Connection;
 use time::PrimitiveDateTime;
+use tokio::fs::File;
+use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader, SeekFrom};
+use tokio::sync::Mutex;
+use tokio::time::sleep;
 use crate::config::Config;
 use crate::{DEFAULT_BLOCK_TIME_SEC, process_ip};
 use crate::state::{Blocked, State};
@@ -17,16 +18,16 @@ const WL: &str = include_str!("whitelist.txt");
 const BL: &str = include_str!("blacklist.txt");
 
 /// Opens an Nginx error log file, parses it line by line and sends IPs of intruders to the specified pipe
-pub fn process_log_file(config: Config, nats: Option<Connection>, banned_count: Arc<AtomicU32>, cache: Arc<Mutex<LruCache<String, bool>>>, state: Arc<Mutex<State>>, file_name: String) {
-    let mut file = match File::open(&file_name) {
+pub async fn process_log_file(config: Config, nats: Option<Client>, banned_count: Arc<AtomicU32>, cache: Arc<Mutex<LruCache<String, bool>>>, state: Arc<Mutex<State>>, file_name: String) {
+    let mut file = match File::open(&file_name).await {
         Ok(file) => file,
         Err(error) => {
             error!("Error opening file: {}", error);
             return;
         }
     };
-    let _ = file.seek(SeekFrom::End(0));
-    let mut inode = get_inode(&file);
+    let _ = file.seek(SeekFrom::End(0)).await;
+    let mut inode = get_inode(&file).await;
 
     let wl = WL.lines().collect::<HashSet<_>>();
     let bl = BL.lines().collect::<HashSet<_>>();
@@ -36,7 +37,7 @@ pub fn process_log_file(config: Config, nats: Option<Connection>, banned_count: 
     let mut reader = BufReader::new(file);
     let mut buffer = String::new();
     loop {
-        match reader.read_line(&mut buffer) {
+        match reader.read_line(&mut buffer).await {
             Ok(size) => {
                 if size > 0 {
                     if buffer.ends_with('\n') {
@@ -51,19 +52,18 @@ pub fn process_log_file(config: Config, nats: Option<Connection>, banned_count: 
                             let score = scores.remove(&client).unwrap();
                             debug!("Baning http bot {} -> {:.2}", &client, score);
                             let ban = format!("{}|http", &client);
-                            process_ip(&config, &nats, &banned_count, &cache, &config.ipset_black_list, &ban);
-                            if let Ok(mut state) = state.lock() {
-                                if let Ok(ip) = client.parse() {
-                                    let blocked = Blocked::new(ip, None, DEFAULT_BLOCK_TIME_SEC);
-                                    state.add_blocked(blocked);
-                                }
+                            process_ip(&config, &nats, &banned_count, &cache, &config.ipset_black_list, &ban).await;
+                            if let Ok(ip) = client.parse() {
+                                let mut state = state.lock().await;
+                                let blocked = Blocked::new(ip, None, DEFAULT_BLOCK_TIME_SEC);
+                                state.add_blocked(blocked);
                             }
                         }
                     }
                 } else {
                     // Probably we have EOF
-                    thread::sleep(Duration::from_millis(200));
-                    let mut file = match File::open(&file_name) {
+                    sleep(Duration::from_millis(200)).await;
+                    let mut file = match File::open(&file_name).await {
                         Ok(file) => file,
                         Err(error) => {
                             error!("Error opening file: {}", error);
@@ -71,10 +71,10 @@ pub fn process_log_file(config: Config, nats: Option<Connection>, banned_count: 
                         }
                     };
 
-                    let new_inode = get_inode(&file);
+                    let new_inode = get_inode(&file).await;
                     if new_inode != inode {
                         info!("Log file rotated, reopening new file");
-                        let _ = file.seek(SeekFrom::End(0));
+                        let _ = file.seek(SeekFrom::End(0)).await;
                         reader = BufReader::new(file);
                         inode = new_inode;
                     }
@@ -90,9 +90,9 @@ pub fn process_log_file(config: Config, nats: Option<Connection>, banned_count: 
 }
 
 #[allow(unused_variables)]
-fn get_inode(file: &File) -> u64 {
+async fn get_inode(file: &File) -> u64 {
     #[cfg(target_os = "linux")]
-    if let Ok(meta) = file.metadata() {
+    if let Ok(meta) = file.metadata().await {
         use std::os::unix::fs::MetadataExt;
         return meta.ino();
     }

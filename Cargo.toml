@@ -18,7 +18,7 @@ toml = "0.8"
 json = "0.12.4"
 byteorder = "1.5.0"
 hostname = "0.4.0"
-nats = "0.25.0"
+async-nats = "0.38.0"
 sqlite = "0.36"
 time = { version = "0.3.36", features = ["formatting"] }
 rand = "0.8.5"
@@ -30,6 +30,9 @@ ratatui = "0.29"
 crossterm = "0.28.1"
 netsock = "0.2.0"
 libc = "=0.2.159"
+tokio = { version = "1.0.0", features = ["rt", "rt-multi-thread", "macros", "process", "fs", "io-std", "full"] }
+futures = "0.3.31"
+reqwest = "0.12.9"
 
 [profile.release]
 opt-level = 3

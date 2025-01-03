@@ -1,11 +1,11 @@
-use std::io::{Read, Write};
+use tokio::sync::Mutex;
 #[cfg(not(windows))]
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::{Arc, Mutex};
-use std::{fs, thread};
-use std::time::Duration;
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::Arc;
+use std::fs;
 use log::{debug, error, info};
+use tokio::time::timeout;
 use crate::state::{LoginState, State};
 use crate::ui::messages::StateMessage;
 
@@ -19,7 +19,7 @@ impl UiServer {
         Self { socket_path, state }
     }
 
-    pub fn start(&self) {
+    pub async fn start(&self) {
         let _ = fs::remove_file(&self.socket_path);
         let listener = match UnixListener::bind(&self.socket_path) {
             Ok(listener) => listener,
@@ -30,19 +30,12 @@ impl UiServer {
         };
 
         info!("UI server activated");
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    let state = Arc::clone(&self.state);
-                    // Spawn a new thread for each incoming connection
-                    thread::spawn(|| {
-                        handle_client(stream, state);
-                    });
-                }
-                Err(e) => {
-                    eprintln!("Error accepting connection: {}", e);
-                    break;
-                }
+        loop {
+            if let Ok((stream, _)) = listener.accept().await {
+                let state = Arc::clone(&self.state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await;
+                });
             }
         }
     }
@@ -54,25 +47,21 @@ impl Drop for UiServer {
     }
 }
 
-fn handle_client(mut stream: UnixStream, state: Arc<Mutex<State>>) {
+async fn handle_client(mut stream: tokio::net::UnixStream, state: Arc<Mutex<State>>) {
     let mut buffer = [0; 512];
 
     info!("UI client connected");
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
     let mut last_item = 0;
     let mut last_time = std::time::Instant::now();
     let mut last_login_state = LoginState::Unknown;
     loop {
-        //TODO read message size
-        let message_size = match stream.read_u64::<BigEndian>() {
-            Ok(size) => size,
-            Err(e) => {
-                debug!("Unable to read UI message size: {e}");
-                0
-            }
+        let message_size = match timeout(tokio::time::Duration::from_millis(50), stream.read_u64()).await {
+            Ok(Ok(size)) => size, // The read was successful within the timeout
+            Ok(Err(_)) => 0,
+            Err(_) => 0
         };
         if message_size > 0 {
-            match stream.read(&mut buffer[0..message_size as usize]) {
+            match stream.read(&mut buffer[0..message_size as usize]).await {
                 Ok(n) if n == 0 => break, // Connection closed
                 Ok(n) => {
                     // TODO check message size == n
@@ -89,13 +78,12 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<State>>) {
                         StateMessage::Ping => {}
                         StateMessage::Changed => {}
                         StateMessage::GetBlocked(_num) => {
-                            if let Ok(state) = state.lock() {
-                                let lines = state.get_blocked(last_item);
-                                let response = StateMessage::Blocked(lines);
-                                let buf = rmp_serde::encode::to_vec_named(&response).unwrap();
-                                if let Err(_) = send_message(&mut stream, &buf) {
-                                    break;
-                                }
+                            let state = state.lock().await;
+                            let lines = state.get_blocked(last_item);
+                            let response = StateMessage::Blocked(lines);
+                            let buf = rmp_serde::encode::to_vec_named(&response).unwrap();
+                            if let Err(_) = send_message(&mut stream, &buf).await {
+                                break;
                             }
                         }
                         StateMessage::Blocked(_) => {}
@@ -109,22 +97,22 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<State>>) {
             }
         }
 
-        let blocked = if let Ok(state) = state.lock() {
+        let blocked = {
+            let state = state.lock().await;
             let blocked = state.get_blocked(last_item);
             if !blocked.is_empty() {
                 Some(blocked)
             } else {
                 None
             }
-        } else {
-            None
         };
         if let Some(blocked) = blocked {
-            info!("Found {} log items, sending", &blocked.len());
+            debug!("Found {} log items, sending", &blocked.len());
             let last = blocked.last().unwrap().id;
             let response = StateMessage::Blocked(blocked);
             let buf = rmp_serde::encode::to_vec_named(&response).unwrap();
-            if let Err(_) = send_message(&mut stream, &buf) {
+            if let Err(e) = send_message(&mut stream, &buf).await {
+                error!("Error sending log lines to UI: {e}");
                 break;
             }
             last_item = last;
@@ -132,16 +120,19 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<State>>) {
         } else if last_time.elapsed().as_secs() > 4 {
             let response = StateMessage::Ping;
             let buf = rmp_serde::encode::to_vec_named(&response).unwrap();
-            if let Err(_) = send_message(&mut stream, &buf) {
+            if let Err(e) = send_message(&mut stream, &buf).await {
+                error!("Error sending ping to UI: {e}");
                 break;
             }
             last_time = std::time::Instant::now();
         }
-        if let Ok(state) = state.lock() {
+        {
+            let state = state.lock().await;
             if last_login_state != state.logged_in {
                 let message = StateMessage::LogStatus(state.logged_in.clone());
                 let buf = rmp_serde::encode::to_vec_named(&message).unwrap();
-                if let Err(_) = send_message(&mut stream, &buf) {
+                if let Err(e) = send_message(&mut stream, &buf).await {
+                    error!("Error sending status to UI: {e}");
                     break;
                 }
                 last_login_state = state.logged_in.clone();
@@ -151,8 +142,8 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<State>>) {
     info!("UI client disconnected");
 }
 
-fn send_message(stream: &mut UnixStream, buf: &Vec<u8>) -> Result<(), std::io::Error> {
-    stream.write_u64::<BigEndian>(buf.len() as u64)?;
-    stream.write_all(&buf)?;
-    stream.flush()
+async fn send_message(stream: &mut UnixStream, buf: &Vec<u8>) -> Result<(), std::io::Error> {
+    stream.write_u64(buf.len() as u64).await?;
+    stream.write_all(&buf).await?;
+    stream.flush().await
 }

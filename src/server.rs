@@ -1,12 +1,13 @@
 use std::hash::Hasher;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
+use async_nats::Client;
+use futures::StreamExt;
 use log::{debug, error, info, trace, warn};
-use nats::Connection;
 use sqlite::State;
 use time::OffsetDateTime;
-use ureq::Agent;
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::Sender;
 use crate::{Config, Stats, utils};
 use crate::config::{DEFAULT_CLIENT_NAME, PREFIX_BL, PREFIX_STATS, PREFIX_WL};
 use crate::utils::{get_ip_and_tag, is_ipv6};
@@ -23,7 +24,7 @@ pub const GET_COUNT: &str = "SELECT bans FROM data WHERE client=? AND blacklist=
 pub const DELETE_FROM_LIST: &str = "DELETE FROM data WHERE client=? AND hostname=? AND blacklist=? AND ip=?;";
 const DEFAULT_TIMEOUT: i64 = 86400;
 
-pub fn run_server(config: Config, nats: Option<Connection>) {
+pub async fn run_server(config: Config, nats: Option<Client>) {
     if nats.is_none() {
         error!("Cannot work in server mode without NATS connection");
         return;
@@ -35,203 +36,236 @@ pub fn run_server(config: Config, nats: Option<Connection>) {
     let db = Arc::new(Mutex::new(db));
 
     let nats = nats.unwrap();
-    if let Ok(sub) = nats.subscribe(&config.nats.wl_init_subject) {
-        let db = db.clone();
-        sub.with_handler(move |message| {
-            let (client, hostname) = get_user_and_host(&message.subject);
-            info!("Got wl init request from {}/{}", &client, &hostname);
-            let buffer = match db.lock() {
-                Ok(db) => get_list(&db, &client, &hostname, false),
-                Err(_) => String::new()
-            };
-            if let Err(e) = message.respond(buffer.as_bytes()) {
-                warn!("Error sending {} to {}: {}", &message.subject, &client, e);
-            }
-            Ok(())
-        });
-        info!("Subscribed to {}", &config.nats.wl_init_subject);
-    }
-
-    if let Ok(sub) = nats.subscribe(&config.nats.bl_init_subject) {
-        let db = db.clone();
-        sub.with_handler(move |message| {
-            let (client, hostname) = get_user_and_host(&message.subject);
-            info!("Got bl init request from {}/{}", &client, &hostname);
-            let buffer = match db.lock() {
-                Ok(db) => {
-                    // We get two lists from DB: global list (from honeypots) and individual list from that client/host
-                    let global_list = get_list(&db, "", "", true);
-                    let my_list = get_list(&db, &client, &hostname, true);
-                    format!("{}\n{}", global_list, my_list)
-                },
-                Err(_) => String::new()
-            };
-            if let Err(e) = message.respond(buffer.as_bytes()) {
-                warn!("Error sending {} to {}: {}", &message.subject, &client, e);
-            }
-            Ok(())
-        });
-        info!("Subscribed to {}", &config.nats.bl_init_subject);
-    }
-
-    // Subscribe to new IPs for whitelist
-    if let Ok(sub) = nats.subscribe(&config.nats.wl_subscribe_subject) {
-        let db = db.clone();
-        sub.with_handler(move |message| {
-            debug!("Got message on {}", &message.subject);
-            let (client, hostname) = get_user_and_host(&message.subject);
-            if let Ok(string) = String::from_utf8(message.data) {
-                if !utils::valid_ip(&string) {
-                    warn!("Could not parse IP {} from {}", &string, &client);
-                    return Ok(());
-                }
-                if let Ok(db) = db.lock() {
-                    let _ = add_to_list(&db, &client, &hostname, false, &string, None);
-                }
-            }
-            Ok(())
-        });
-        info!("Subscribed to {}", &config.nats.wl_subscribe_subject);
-    }
-
-    let agent = ureq::AgentBuilder::new()
-        .user_agent(&format!("DisWall v{}", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(3))
-        .max_idle_connections_per_host(4)
-        .max_idle_connections(16)
-        .build();
-
-    // Subscribe for new IPs for blocklist
-    if let Ok(sub) = nats.subscribe(&config.nats.bl_subscribe_subject) {
-        let db = db.clone();
-        let nats = nats.clone();
-        let config = config.clone();
-        let agent = agent.clone();
-        let subject = config.nats.bl_subscribe_subject.clone();
-        let ignore_ips = config.ignore_ips.clone();
-        let default_channel = format!("{}.{}", PREFIX_BL, DEFAULT_CLIENT_NAME);
-        sub.with_handler(move |message| {
-            let (client, hostname) = get_user_and_host(&message.subject);
-            debug!("Got message on {} from {:?}", &message.subject, (&client, &hostname));
-            if let Ok(data) = String::from_utf8(message.data) {
-                // If the client sent us the tag
-                let (ip, mut tag) = get_ip_and_tag(&data);
-                if !utils::valid_ip(&ip) {
-                    warn!("Could not parse IP {} from {}", &ip, &client);
-                    return Ok(());
-                }
-                if ignore_ips.contains(&ip) {
-                    debug!("Ignoring IP {ip}");
-                    return Ok(());
-                }
-                if tag.len() > 25 {
-                    warn!("Too long tag '{}' from {}", &tag, &client);
-                    return Ok(());
-                }
-                if tag.is_empty() {
-                    info!("Got IP {} from {}/{}", &ip, &client, &hostname);
-                } else {
-                    info!("Got IP {} with tag '{}' from {}/{}", &ip, &tag, &client, &hostname);
-                }
-
-                let time = OffsetDateTime::now_utc().unix_timestamp();
-                let client_mix = mix_client(format!("{}/{}/{}", &client, &hostname, &config.clickhouse.salt).as_bytes());
-                // If this IP was sent by one of our honeypots we add this IP without client and hostname
-                let (client, hostname, honeypot) = match config.nats.honeypots.contains(&client) {
-                    true => (String::new(), String::new(), true),
-                    false => (client, hostname, false)
+    let nats2 = nats.clone();
+    let subject = config.nats.wl_init_subject.clone();
+    let db2 = db.clone();
+    tokio::spawn(async move {
+        if let Ok(mut sub) = nats2.subscribe(subject.clone()).await {
+            while let Some(message) = sub.next().await {
+                let (client, hostname) = get_user_and_host(&message.subject);
+                info!("Got wl init request from {}/{}", &client, &hostname);
+                let buffer = match db2.lock() {
+                    Ok(db) => get_list(&db, &client, &hostname, false),
+                    Err(_) => String::new()
                 };
-                let timeout = if let Ok(db) = db.lock() {
-                    add_to_list(&db, &client, &hostname, true, &ip, None)
-                } else {
-                    0
-                };
+                if let Err(e) = nats2.publish_with_reply(message.subject.clone(), message.subject.clone(), buffer.into()).await {
+                    warn!("Error sending {} to {}: {}", &message.subject, &client, e);
+                }
+            }
+            info!("Subscribed to {}", &subject);
+        }
+    });
 
-                if honeypot {
-                    let capped = cap_timeout(timeout);
-                    let msg = format!("{}|{}", &ip, capped);
-                    match nats.publish(&config.nats.bl_global_subject, &msg) {
-                        Ok(_) => info!("Pushed {} to [{}]", &msg, &config.nats.bl_global_subject),
-                        Err(e) => warn!("Error pushing {} to [{}]: {}", &msg, &config.nats.bl_global_subject, e)
+    let nats2 = nats.clone();
+    let subject = config.nats.bl_init_subject.clone();
+    let db2 = db.clone();
+    tokio::spawn(async move {
+        if let Ok(mut sub) = nats2.subscribe(subject.clone()).await {
+            while let Some(message) = sub.next().await {
+                let (client, hostname) = get_user_and_host(&message.subject);
+                info!("Got bl init request from {}/{}", &client, &hostname);
+                let buffer = match db2.lock() {
+                    Ok(db) => {
+                        // We get two lists from DB: global list (from honeypots) and individual list from that client/host
+                        let global_list = get_list(&db, "", "", true);
+                        let my_list = get_list(&db, &client, &hostname, true);
+                        format!("{}\n{}", global_list, my_list)
+                    },
+                    Err(_) => String::new()
+                };
+                if let Err(e) = nats2.publish_with_reply(message.subject.clone(), message.subject.clone(), buffer.into()).await {
+                    warn!("Error sending {} to {}: {}", &message.subject, &client, e);
+                }
+            }
+            info!("Subscribed to {}", &subject);
+        }
+    });
+
+    let nats2 = nats.clone();
+    let subject = config.nats.wl_subscribe_subject.clone();
+    let db2 = db.clone();
+    tokio::spawn(async move {
+        // Subscribe to new IPs for whitelist
+        if let Ok(mut sub) = nats2.subscribe(subject.clone()).await {
+            while let Some(message) = sub.next().await {
+                debug!("Got message on {}", &message.subject);
+                let (client, hostname) = get_user_and_host(&message.subject);
+                if let Ok(string) = String::from_utf8(message.payload.to_vec()) {
+                    if !utils::valid_ip(&string) {
+                        warn!("Could not parse IP {} from {}", &string, &client);
+                        continue;
                     }
-                    // Send only long bans for default (not registered) users
-                    if capped > DEFAULT_TIMEOUT {
-                        match nats.publish(&default_channel, &msg) {
-                            Ok(_) => info!("Pushed {} to [{}]", &msg, &default_channel),
-                            Err(e) => warn!("Error pushing {} to [{}]: {}", &msg, &default_channel, e)
+                    if let Ok(db) = db2.lock() {
+                        let _ = add_to_list(&db, &client, &hostname, false, &string, None);
+                    }
+                }
+            }
+            info!("Subscribed to {}", &config.nats.wl_subscribe_subject);
+        }
+    });
+
+    let (tx, mut rx) = mpsc::channel::<String>(100);
+    let client = Arc::new(reqwest::Client::new());
+    tokio::spawn({
+        let client = client.clone();
+        let clickhouse_url = config.clickhouse.url.clone();
+        let clickhouse_user = config.clickhouse.login.clone();
+        let clickhouse_password = config.clickhouse.password.clone();
+        let clickhouse_database = config.clickhouse.database.clone();
+
+        async move {
+            while let Some(request) = rx.recv().await {
+                if let Err(e) = send_clickhouse_request(&client, &clickhouse_url, &clickhouse_user, &clickhouse_password, &clickhouse_database, &request).await {
+                    warn!("Failed to send request: {}", e);
+                }
+            }
+        }
+    });
+
+    tokio::spawn({
+        let nats2 = nats.clone();
+        let subject = config.nats.bl_subscribe_subject.clone();
+        let bl_global_subject = config.nats.bl_global_subject.clone();
+        let db2 = db.clone();
+        let ignore_ips = config.ignore_ips.clone();
+        let tx = tx.clone(); // Clone the sender for this task
+
+        async move {
+            if let Ok(mut sub) = nats2.subscribe(subject.clone()).await {
+                let default_channel = format!("{}.{}", PREFIX_BL, DEFAULT_CLIENT_NAME);
+                while let Some(message) = sub.next().await {
+                    let (client, hostname) = get_user_and_host(&message.subject);
+                    debug!("Got message on {} from {:?}", &message.subject, (&client, &hostname));
+                    if let Ok(data) = String::from_utf8(message.payload.to_vec()) {
+                        // If the client sent us the tag
+                        let (ip, mut tag) = get_ip_and_tag(&data);
+                        if !utils::valid_ip(&ip) {
+                            warn!("Could not parse IP {} from {}", &ip, &client);
+                            continue;
+                        }
+                        if ignore_ips.contains(&ip) {
+                            debug!("Ignoring IP {ip}");
+                            continue;
+                        }
+                        if tag.len() > 25 {
+                            warn!("Too long tag '{}' from {}", &tag, &client);
+                            continue;
+                        }
+                        if tag.is_empty() {
+                            info!("Got IP {} from {}/{}", &ip, &client, &hostname);
+                        } else {
+                            info!("Got IP {} with tag '{}' from {}/{}", &ip, &tag, &client, &hostname);
+                        }
+
+                        let time = OffsetDateTime::now_utc().unix_timestamp();
+                        let client_mix = mix_client(format!("{}/{}/{}", &client, &hostname, &config.clickhouse.salt).as_bytes());
+                        // If this IP was sent by one of our honeypots we add this IP without client and hostname
+                        let (client, hostname, honeypot) = match config.nats.honeypots.contains(&client) {
+                            true => (String::new(), String::new(), true),
+                            false => (client, hostname, false)
+                        };
+                        let timeout = if let Ok(db) = db2.lock() {
+                            add_to_list(&db, &client, &hostname, true, &ip, None)
+                        } else {
+                            0
+                        };
+
+                        if honeypot {
+                            let capped = cap_timeout(timeout);
+                            let msg = format!("{}|{}", &ip, capped);
+                            match nats2.publish(bl_global_subject.clone(), msg.clone().into()).await {
+                                Ok(_) => info!("Pushed {} to [{}]", &msg, &bl_global_subject),
+                                Err(e) => warn!("Error pushing {} to [{}]: {}", &msg, &bl_global_subject, e)
+                            }
+                            // Send only long bans for default (not registered) users
+                            if capped > DEFAULT_TIMEOUT {
+                                match nats2.publish(default_channel.clone(), msg.clone().into()).await {
+                                    Ok(_) => info!("Pushed {} to [{}]", &msg, &default_channel),
+                                    Err(e) => warn!("Error pushing {} to [{}]: {}", &msg, &default_channel, e)
+                                }
+                            }
+                        } else {
+                            // We push tag only from honeypots
+                            tag.clear();
+                        }
+                        let table_suffix = match is_ipv6(&ip) {
+                            true => "6",
+                            false => ""
+                        };
+                        let request = format!("INSERT INTO scanners{} VALUES ({}, {}, {}, '{}', '{}')", table_suffix, &client_mix, time, time + timeout, &ip, &tag);
+                        if let Err(e) = tx.send(request).await {
+                            warn!("Failed to send request to channel: {}", e);
+                        }
+                        let request = format!("INSERT INTO nats_data{} (client, hostname, blacklist, ip, until) VALUES ('{}', '{}', {}, '{}', {})", table_suffix, &client, &hostname, 1, &ip, time + timeout);
+                        if let Err(e) = tx.send(request).await {
+                            warn!("Failed to send request to channel: {}", e);
                         }
                     }
-                } else {
-                    // We push tag only from honeypots
-                    tag.clear();
                 }
-                let table_suffix = match is_ipv6(&ip) {
-                    true => "6",
-                    false => ""
-                };
-                let request = format!("INSERT INTO scanners{} VALUES ({}, {}, {}, '{}', '{}')", table_suffix, &client_mix, time, time + timeout, &ip, &tag);
-                send_clickhouse_request(&agent, &config, &request);
-                let request = format!("INSERT INTO nats_data{} (client, hostname, blacklist, ip, until) VALUES ('{}', '{}', {}, '{}', {})", table_suffix, &client, &hostname, 1, &ip, time + timeout);
-                send_clickhouse_request(&agent, &config, &request);
+                info!("Subscribed to {}", &subject);
             }
-            Ok(())
-        });
-        info!("Subscribed to {}", &subject);
-    }
+        }
+    });
 
-    // Subscribe for IPs to delete from whitelist
-    if let Ok(sub) = nats.subscribe(&config.nats.wl_del_subject) {
-        let db = db.clone();
-        sub.with_handler(move |message| {
-            let (client, hostname) = get_user_and_host(&message.subject);
-            debug!("Got message on {} from {:?}", &message.subject, (&client, &hostname));
-            if let Ok(string) = String::from_utf8(message.data) {
-                if !utils::valid_ip(&string) {
-                    warn!("Could not parse IP {} from {}", &string, &client);
-                    return Ok(());
-                }
-                if let Ok(db) = db.lock() {
-                    if let Err(e) = delete_from_list(&db, &client, &hostname, false, &string) {
-                        warn!("Error removing from DB: {}", e);
+    let nats2 = nats.clone();
+    let subject = config.nats.wl_del_subject.clone();
+    let db2 = db.clone();
+    tokio::spawn(async move {
+        // Subscribe for IPs to delete from whitelist
+        if let Ok(mut sub) = nats2.subscribe(subject.clone()).await {
+            while let Some(message) = sub.next().await {
+                let (client, hostname) = get_user_and_host(&message.subject);
+                debug!("Got message on {} from {:?}", &message.subject, (&client, &hostname));
+                if let Ok(string) = String::from_utf8(message.payload.to_vec()) {
+                    if !utils::valid_ip(&string) {
+                        warn!("Could not parse IP {} from {}", &string, &client);
+                        continue;
+                    }
+                    if let Ok(db) = db2.lock() {
+                        if let Err(e) = delete_from_list(&db, &client, &hostname, false, &string) {
+                            warn!("Error removing from DB: {}", e);
+                        }
                     }
                 }
             }
-            Ok(())
-        });
-        info!("Subscribed to {}", &config.nats.wl_del_subject);
-    }
+            info!("Subscribed to {}", &subject);
+        }
+    });
 
-    // Subscribe for IPs to delete from blocklist
-    if let Ok(sub) = nats.subscribe(&config.nats.bl_del_subject) {
-        let db = db.clone();
-        sub.with_handler(move |message| {
-            let (client, hostname) = get_user_and_host(&message.subject);
-            debug!("Got message on {} from {:?}", &message.subject, (&client, &hostname));
-            if let Ok(string) = String::from_utf8(message.data) {
-                if !utils::valid_ip(&string) {
-                    warn!("Could not parse IP {} from {}", &string, &client);
-                    return Ok(());
-                }
-                if let Ok(db) = db.lock() {
-                    if let Err(e) = delete_from_list(&db, &client, &hostname, true, &string) {
-                        warn!("Error removing from DB: {}", e);
+    let nats2 = nats.clone();
+    let subject = config.nats.bl_del_subject.clone();
+    let db2 = db.clone();
+    tokio::spawn(async move {
+        // Subscribe for IPs to delete from blocklist
+        if let Ok(mut sub) = nats2.subscribe(subject.clone()).await {
+            while let Some(message) = sub.next().await {
+                let (client, hostname) = get_user_and_host(&message.subject);
+                debug!("Got message on {} from {:?}", &message.subject, (&client, &hostname));
+                if let Ok(string) = String::from_utf8(message.payload.to_vec()) {
+                    if !utils::valid_ip(&string) {
+                        warn!("Could not parse IP {} from {}", &string, &client);
+                        continue;
+                    }
+                    if let Ok(db) = db2.lock() {
+                        if let Err(e) = delete_from_list(&db, &client, &hostname, true, &string) {
+                            warn!("Error removing from DB: {}", e);
+                        }
                     }
                 }
             }
-            Ok(())
-        });
-        info!("Subscribed to {}", &config.nats.bl_del_subject);
-    }
+            info!("Subscribed to {}", &subject);
+        }
+    });
 
     if config.send_statistics && !config.clickhouse.url.is_empty() {
-        start_stats_handler(&config, nats.clone(), agent);
+        start_stats_handler(config.nats.stats_subject.clone(), nats.clone(), tx).await;
     }
 
     // We just loop here until we die
     let delay = Duration::from_secs(1);
     let mut timer = Instant::now();
     loop {
-        thread::sleep(delay);
+        tokio::time::sleep(delay).await;
         if timer.elapsed().as_secs() >= 300 {
             if let Ok(db) = db.lock() {
                 let count = count_list(&db, "", "", true);
@@ -251,47 +285,48 @@ fn cap_timeout(timeout: i64) -> i64 {
     }
 }
 
-fn start_stats_handler(config: &Config, nats: Connection, agent: Agent) {
-    // Subscribe for IPs to delete from blocklist
-    if let Ok(sub) = nats.subscribe(&config.nats.stats_subject) {
-        let config = config.clone();
-        let subject = config.nats.stats_subject.clone();
-        sub.with_handler(move |message| {
-            let (client, hostname) = get_user_and_host(&message.subject);
-            debug!("Got message on {} from {:?}", &message.subject, (&client, &hostname));
-            if let Ok(string) = String::from_utf8(message.data) {
-                match serde_json::from_str::<Stats>(&string) {
-                    Ok(stats) => {
-                        let request = format!("INSERT INTO stats VALUES ('{}/{}', {}, {}, {}, {}, {}, {})",
-                                              &client, &hostname, stats.time, stats.banned,
-                                              stats.packets_dropped, stats.bytes_dropped,
-                                              stats.packets_accepted, stats.bytes_accepted);
-                        send_clickhouse_request(&agent, &config, &request);
+/// Gets all stats data from clients through NATS and posts it into Clickhouse
+async fn start_stats_handler(stats_subject: String, nats: Client, tx: Sender<String>) {
+    tokio::spawn(async move {
+        // Subscribe for IPs to delete from blocklist
+        if let Ok(mut sub) = nats.subscribe(stats_subject.clone()).await {
+            while let Some(message) = sub.next().await {
+                let (client, hostname) = get_user_and_host(&message.subject);
+                debug!("Got message on {} from {:?}", &message.subject, (&client, &hostname));
+                if let Ok(string) = String::from_utf8(message.payload.to_vec()) {
+                    match serde_json::from_str::<Stats>(&string) {
+                        Ok(stats) => {
+                            let request = format!("INSERT INTO stats VALUES ('{}/{}', {}, {}, {}, {}, {}, {})",
+                                                  &client, &hostname, stats.time, stats.banned,
+                                                  stats.packets_dropped, stats.bytes_dropped,
+                                                  stats.packets_accepted, stats.bytes_accepted);
+                            if let Err(e) = tx.send(request).await {
+                                warn!("Failed to send request to channel: {}", e);
+                            }
+                        }
+                        Err(e) => error!("Could not deserialize stats from {}: {}. String: {}", &client, e, &string)
                     }
-                    Err(e) => error!("Could not deserialize stats from {}: {}. String: {}", &client, e, &string)
                 }
             }
-            Ok(())
-        });
-        info!("Subscribed to {}", &subject);
-    }
+            info!("Subscribed to {}", &stats_subject);
+        }
+    });
 }
 
-fn send_clickhouse_request(agent: &Agent, config: &Config, request: &str) {
-    let response = agent
-        .post(&config.clickhouse.url)
-        .set("X-ClickHouse-User", &config.clickhouse.login)
-        .set("X-ClickHouse-Key", &config.clickhouse.password)
-        .set("X-ClickHouse-Database", &config.clickhouse.database)
-        .send_bytes(request.as_bytes());
-    match response {
-        Ok(response) => {
-            if response.status() != 200 {
-                warn!("Clickhouse response is {:?}", &response);
-            }
-        }
-        Err(e) => warn!("Failed to send stats to clickhouse: {}", e)
+async fn send_clickhouse_request(client: &Arc<reqwest::Client>, url: &str, user: &str, password: &str, database: &str, request: &str,) -> Result<(), reqwest::Error> {
+    let response = client
+        .post(url)
+        .header("X-ClickHouse-User", user)
+        .header("X-ClickHouse-Key", password)
+        .header("X-ClickHouse-Database", database)
+        .body(request.to_string())
+        .send()
+        .await?;
+
+    if response.status() != reqwest::StatusCode::OK {
+        warn!("ClickHouse response: {:?}", response.text().await?);
     }
+    Ok(())
 }
 
 fn get_list(db: &sqlite::Connection, client: &str, hostname: &str, blacklist: bool) -> String {
