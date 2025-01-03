@@ -1,18 +1,18 @@
 use std::{env, fs, io, thread};
 use std::cmp::min;
 use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
+use std::io::{ErrorKind, Seek, SeekFrom};
 use std::net::IpAddr;
 use std::num::{NonZeroUsize};
-use std::process::{Command, exit, Stdio};
-use std::sync::{Arc, Mutex, RwLock};
+use std::process::Stdio;
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use getopts::{Matches, Options};
 use lazy_static::lazy_static;
 use log::{debug, error, info, LevelFilter, trace, warn};
-use nats::Connection;
+use async_nats::{Client, Event};
+use futures::StreamExt;
 use simplelog::{ColorChoice, CombinedLogger, ConfigBuilder, format_description, LevelPadding, TerminalMode, TermLogger, WriteLogger};
 use time::OffsetDateTime;
 use crate::config::{Config, DEFAULT_CLIENT_NAME, FwType};
@@ -23,6 +23,12 @@ use crate::timer::HourlyTimer;
 use crate::types::Stats;
 use crate::utils::{extract_between_brackets, get_first_part, get_ip_and_tag, get_ip_and_timeout, is_ipv6, reduce_spaces};
 use lru::LruCache;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::process::Command;
+use tokio::runtime::Builder;
+use tokio::sync::Mutex;
+use tokio::task;
+use tokio::time::sleep;
 use utils::valid_ip;
 use crate::firewall::get_installed_fw_type;
 #[cfg(not(windows))]
@@ -95,15 +101,20 @@ fn main() -> Result<(), i32> {
     }
 
     if let Some(ip) = opt_matches.opt_str("k") {
-        if kill_connection(&ip) {
-            println!("Killed connection with {}", &ip);
-        }
+        let rt = Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            if kill_connection(&ip).await {
+                println!("Killed connection with {}", &ip);
+            }
+        });
         return Ok(())
     }
 
     #[cfg(not(windows))]
     if opt_matches.opt_present("i") {
-        setup_logger(&opt_matches);
+        if let Err(_) = setup_logger(&opt_matches) {
+            return Err(1);
+        }
         info!("Starting DisWall UI...");
         let client = UiClient::new(UI_SOCK_ADDR.to_string());
         if let Err(e) = client.start() {
@@ -120,7 +131,9 @@ fn main() -> Result<(), i32> {
     // Override config options by options from arguments
     config.override_config_from_args(&opt_matches);
     config.init_nats_subjects();
-    setup_logger(&opt_matches);
+    if let Err(_) = setup_logger(&opt_matches) {
+        return Err(1);
+    }
     match get_installed_fw_type() {
         Ok(t) => config.fw_type = t,
         Err(e) => {
@@ -148,7 +161,7 @@ fn main() -> Result<(), i32> {
             let _ = fs::remove_file("/var/log/diswall/diswall.pipe");
             // We restart service only for old update code in `install::update_client()`.
             // TODO: This code will be removed in next version
-            match Command::new("systemctl").arg("restart").arg("diswall").stdout(Stdio::null()).spawn() {
+            match std::process::Command::new("systemctl").arg("restart").arg("diswall").stdout(Stdio::null()).spawn() {
                 Ok(mut child) => {
                     if let Ok(r) = child.wait() {
                         if r.success() {
@@ -214,13 +227,23 @@ fn main() -> Result<(), i32> {
         }
     }
 
+    let runtime = Builder::new_multi_thread()
+        .worker_threads(4) // Set to 4 threads
+        .enable_all()
+        .build()
+        .unwrap();
+
+    runtime.block_on(async_main(&opt_matches, config))
+}
+
+async fn async_main(opt_matches: &Matches, mut config: Config) -> Result<(), i32> {
     debug!("Loaded config:\n{:#?}", &config);
     let cache = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(8).unwrap())));
 
     #[cfg(not(windows))]
-    thread::spawn(|| {
+    tokio::spawn(async {
         let server = UiServer::new(UI_SOCK_ADDR.to_string(), Arc::clone(&STATE));
-        server.start();
+        server.start().await;
     });
 
     let start_nats = !config.local_only &&
@@ -231,25 +254,45 @@ fn main() -> Result<(), i32> {
     let nats = if start_nats {
         //let hostname = config::get_hostname();
         debug!("Connecting to NATS server...");
-        let nats = nats::Options::with_user_pass(&config.nats.client_name, &config.nats.client_pass)
-            .with_name("DisWall")
-            .error_callback(|error| {
-                error!("NATS error: {}", error);
-                if let Ok(mut state) = STATE.lock() {
-                    state.logged_in = LoginState::Error(error.to_string())
+        let nats = async_nats::ConnectOptions::new()
+            .user_and_password(config.nats.client_name.clone(), config.nats.client_pass.clone())
+            .require_tls(false) //TODO implement later
+            .name("DisWall")
+            .event_callback(move |event| {
+                let client_name = client_name.clone();
+                async move {
+                    match event {
+                        Event::Connected => {
+                            info!("Connected or reconnected to NATS server");
+                            let mut state = STATE.lock().await;
+                            state.logged_in = LoginState::LoggedIn(client_name.clone());
+                        }
+                        Event::Disconnected | Event::Closed => {
+                            error!("Disconnected from NATS server");
+                            let mut state = STATE.lock().await;
+                            state.logged_in = LoginState::Default;
+                        }
+                        Event::ServerError(e) => {
+                            error!("NATS error: {}", e);
+                            let mut state = STATE.lock().await;
+                            state.logged_in = LoginState::Error(e.to_string());
+                        }
+                        Event::ClientError(e) => {
+                            error!("NATS error: {}", e);
+                            let mut state = STATE.lock().await;
+                            state.logged_in = LoginState::Error(e.to_string());
+                        }
+                        _ => {}
+                    }
                 }
             })
-            .retry_on_failed_connect()
-            .reconnect_callback(move || {
-                info!("Reconnected to NATS server");
-                if let Ok(mut state) = STATE.lock() {
-                    state.logged_in = LoginState::LoggedIn(client_name.clone())
-                }
-            })
-            .reconnect_buffer_size(32 * 1024 * 1024)
+            .retry_on_initial_connect()
             .max_reconnects(1_000_000)
+            .ping_interval(Duration::from_secs(15))
+            .connection_timeout(Duration::from_secs(10))
+            .request_timeout(Some(Duration::from_secs(10)))
             .reconnect_delay_callback(reconnect_timer)
-            .connect(format!("nats://{}:{}", &config.nats.server, &config.nats.port));
+            .connect(format!("nats://{}:{}", &config.nats.server, &config.nats.port)).await;
         match nats {
             Err(e) => {
                 error!("Error connecting to NATS server: {}", e);
@@ -257,26 +300,27 @@ fn main() -> Result<(), i32> {
             }
             Ok(nats) => {
                 let nats_clone = Some(nats.clone());
-                if process_ips_from_parameters(&config, &opt_matches, nats_clone) {
+                if process_ips_from_parameters(&config, &opt_matches, nats_clone).await {
                     return Ok(());
                 }
                 if !config.server_mode {
                     info!("Connected to NATS server, setting up handlers");
-                    if let Ok(mut state) = STATE.lock() {
+                    {
+                        let mut state = STATE.lock().await;
                         if config.nats.client_name == DEFAULT_CLIENT_NAME {
                             state.logged_in = LoginState::Default;
                         } else {
                             state.logged_in = LoggedIn(config.nats.client_name.clone());
                         }
                     }
-                    start_nats_handlers(&mut config, &nats, Arc::clone(&cache), Arc::clone(&STATE));
+                    start_nats_handlers(&mut config, nats.clone(), Arc::clone(&cache), Arc::clone(&STATE)).await;
                 }
                 Some(nats)
             }
         }
     } else {
         debug!("Starting in local only mode...");
-        if process_ips_from_parameters(&config, &opt_matches, None) {
+        if process_ips_from_parameters(&config, &opt_matches, None).await {
             return Ok(());
         }
         None
@@ -284,23 +328,28 @@ fn main() -> Result<(), i32> {
 
     // If this binary is executed with 'server' parameter we start only NATS server
     if config.server_mode {
-        run_server(config, nats);
+        run_server(config, nats).await;
         return Ok(());
     }
 
     let banned_count = Arc::new(AtomicU32::new(0));
     if config.send_statistics && config.nats.client_name.ne(DEFAULT_CLIENT_NAME) {
         if let Some(nats) = nats.clone() {
+            let config = config.clone();
             let banned_count = banned_count.clone();
-            let black_list_name = config.ipset_black_list.clone();
-            let white_list_name = config.ipset_white_list.clone();
-            let subject = config.nats.stats_subject.clone();
-            let fw_type = config.fw_type.clone();
-            let prev_stats = Arc::new(RwLock::new(Stats::default()));
-            let mut timer = HourlyTimer::new(move || {
-                match fw_type {
-                    FwType::IpTables => collect_stats_from_iptables(&black_list_name, &subject, &nats, &banned_count, &prev_stats),
-                    FwType::NfTables => collect_stats_from_nftables(&black_list_name, &white_list_name, &subject, &nats, &banned_count, &prev_stats)
+            let timer = HourlyTimer::new(move || {
+                let banned_count = banned_count.clone();
+                let black_list_name = config.ipset_black_list.clone();
+                let white_list_name = config.ipset_white_list.clone();
+                let subject = config.nats.stats_subject.clone();
+                let fw_type = config.fw_type.clone();
+                let prev_stats = Arc::new(RwLock::new(Stats::default()));
+                let nats = nats.clone();
+                async move {
+                    match fw_type {
+                        FwType::IpTables => collect_stats_from_iptables(&black_list_name, &subject, &nats, &banned_count, &prev_stats).await,
+                        FwType::NfTables => collect_stats_from_nftables(&black_list_name, &white_list_name, &subject, &nats, &banned_count, &prev_stats).await
+                    }
                 }
             });
             let _ = timer.start();
@@ -316,14 +365,21 @@ fn main() -> Result<(), i32> {
             let banned_count = banned_count.clone();
             let nats = nats.clone();
             let config = config.clone();
-            thread::spawn(move || {
-                addons::nginx::process_log_file(config, nats, banned_count, cache, state, log);
+            tokio::spawn(async move {
+                addons::nginx::process_log_file(config, nats, banned_count, cache, state, log).await;
             });
         }
     }
 
-    if let Err(e) = lock_on_log_read(config, nats, &banned_count, Arc::clone(&cache), Arc::clone(&STATE)) {
-        error!("Error reading journalctl: {}", e);
+    let handle = task::spawn(lock_on_log_read(config, nats, banned_count, Arc::clone(&cache)));
+
+    // Wait for the task to finish
+    match handle.await {
+        Ok(result) => match result {
+            Ok(_) => println!("Task completed successfully."),
+            Err(e) => eprintln!("Error reading journalctl: {}", e),
+        },
+        Err(join_err) => eprintln!("Task panicked: {:?}", join_err),
     }
     Ok(())
 }
@@ -336,38 +392,37 @@ fn reconnect_timer(c: usize) -> Duration {
     }
 }
 
-fn process_ips_from_parameters(config: &Config, opt_matches: &Matches, nats: Option<Connection>) -> bool {
+async fn process_ips_from_parameters(config: &Config, opt_matches: &Matches, nats: Option<Client>) -> bool {
     if let Some(ip) = opt_matches.opt_str("wl-add-ip") {
         let comment = match opt_matches.opt_str("wl-add-comm") {
             None => None,
             Some(s) => Some(s)
         };
-        return modify_list(&config.fw_type, true, &nats, &config.ipset_white_list, &config.nats.wl_push_subject, &ip, comment);
+        return modify_list(&config.fw_type, true, &nats, &config.ipset_white_list, &config.nats.wl_push_subject, &ip, comment).await;
     }
 
     if let Some(ip) = opt_matches.opt_str("wl-del-ip") {
-        return modify_list(&config.fw_type, false, &nats, &config.ipset_white_list, &config.nats.wl_del_subject, &ip, None);
+        return modify_list(&config.fw_type, false, &nats, &config.ipset_white_list, &config.nats.wl_del_subject, &ip, None).await;
     }
 
     if let Some(ip) = opt_matches.opt_str("bl-add-ip") {
-        if modify_list(&config.fw_type, true, &nats, &config.ipset_black_list, &config.nats.bl_push_subject, &ip, None) {
+        if modify_list(&config.fw_type, true, &nats, &config.ipset_black_list, &config.nats.bl_push_subject, &ip, None).await {
             let _ = kill_connection(&ip);
             return true;
         }
     }
 
     if let Some(ip) = opt_matches.opt_str("bl-del-ip") {
-        return modify_list(&config.fw_type, true, &nats, &config.ipset_black_list, &config.nats.bl_del_subject, &ip, None);
+        return modify_list(&config.fw_type, true, &nats, &config.ipset_black_list, &config.nats.bl_del_subject, &ip, None).await;
     }
 
     false
 }
 
-fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<LruCache<String, bool>>>, state: Arc<Mutex<State>>) {
-    let msg = String::new();
-    match nats.request(&config.nats.wl_init_subject, &msg) {
+async fn start_nats_handlers(config: &mut Config, nats: Client, cache: Arc<Mutex<LruCache<String, bool>>>, state: Arc<Mutex<State>>) {
+    match nats.request(config.nats.wl_init_subject.clone(), "empty".into()).await {
         Ok(message) => {
-            let string = String::from_utf8(message.data).unwrap_or(String::default());
+            let string = String::from_utf8(message.payload.to_vec()).unwrap_or(String::default());
             let mut buf = String::new();
             for line in string.lines() {
                 let ip = get_first_part(line);
@@ -396,14 +451,14 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
     }
 
     // Getting blocklist from server
-    match nats.request(&config.nats.bl_init_subject, &msg) {
+    match nats.request(config.nats.bl_init_subject.clone(), "empty".into()).await {
         Ok(message) => {
             let default_timeout = if config.max_block_time > 0 {
                 min(DEFAULT_BLOCK_TIME_SEC, config.max_block_time)
             } else {
                 DEFAULT_BLOCK_TIME_SEC
             };
-            let string = String::from_utf8(message.data).unwrap_or(String::default());
+            let string = String::from_utf8(message.payload.to_vec()).unwrap_or(String::default());
             let mut buf = String::new();
             for line in string.lines() {
                 let (ip, timeout) = get_ip_and_timeout(&line);
@@ -424,20 +479,20 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
                     }
                 };
                 buf.push_str(&line);
-                trace!("To blacklist: {}", &line);
-                if let Ok(mut state) = state.lock() {
-                    if let Ok(ip) = ip.parse() {
-                        info!("Adding IP {}", &ip);
-                        let blocked = Blocked::new(ip, None, timeout);
-                        state.add_blocked(blocked);
-                    } else {
-                        error!("Error parsing IP {} from line '{}'", &ip, &line);
-                    }
+                let mut state = state.lock().await;
+                if let Ok(ip) = ip.parse() {
+                    debug!("Adding IP {}", &ip);
+                    let blocked = Blocked::new(ip, None, timeout);
+                    state.add_blocked(blocked);
+                } else {
+                    error!("Error parsing IP {} from line '{}'", &ip, &line);
                 }
             }
-            if let Ok(state) = state.lock() {
+            {
+                let state = state.lock().await;
                 info!("Added {} items to state", &state.blocked.len());
             }
+
             match config.fw_type {
                 FwType::IpTables => firewall::ipset_restore(&buf),
                 FwType::NfTables => firewall::nft_restore(&buf)
@@ -446,63 +501,68 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
         Err(e) => error!("Error requesting BL from NATS server: {}", e)
     }
 
-    // Subscribe to new IPs for whitelist
-    if let Ok(sub) = nats.subscribe(&config.nats.wl_subscribe_subject) {
-        let list_name = config.ipset_white_list.clone();
-        let fw_type = config.fw_type.clone();
-        sub.with_handler(move |message| {
-            if let Ok(string) = String::from_utf8(message.data) {
-                let split = string.split("|").collect::<Vec<&str>>();
-                let list = match is_ipv6(split[0]) {
-                    true => format!("{}6", list_name),
-                    false => list_name.to_owned()
-                };
-                match fw_type {
-                    FwType::IpTables => {
-                        // If no comment
-                        if split.len() == 1 {
-                            debug!("Got IP for whitelist: {}", split[0]);
-                            firewall::ipset_add_or_del("add", &list, split[0], None)
-                        } else {
-                            debug!("Got IP for whitelist: {} ({})", split[0], split[1]);
-                            firewall::ipset_add_or_del("add", &list, split[0], Some(split[1].to_owned()));
-                        }
-                    },
-                    FwType::NfTables => firewall::nft_add(&list, split[0])
+    let list_name = config.ipset_white_list.clone();
+    let fw_type = config.fw_type.clone();
+    let subject = config.nats.wl_subscribe_subject.clone();
+    let nats2 = nats.clone();
+    tokio::spawn(async move {
+        // Subscribe to new IPs for whitelist
+        if let Ok(mut sub) = nats2.subscribe(subject.clone()).await {
+            while let Some(message) = sub.next().await {
+                if let Ok(string) = String::from_utf8(message.payload.to_vec()) {
+                    let split = string.split("|").collect::<Vec<&str>>();
+                    let list = match is_ipv6(split[0]) {
+                        true => format!("{}6", list_name),
+                        false => list_name.to_owned()
+                    };
+                    match fw_type {
+                        FwType::IpTables => {
+                            // If no comment
+                            if split.len() == 1 {
+                                debug!("Got IP for whitelist: {}", split[0]);
+                                firewall::ipset_add_or_del("add", &list, split[0], None)
+                            } else {
+                                debug!("Got IP for whitelist: {} ({})", split[0], split[1]);
+                                firewall::ipset_add_or_del("add", &list, split[0], Some(split[1].to_owned()));
+                            }
+                        },
+                        FwType::NfTables => firewall::nft_add(&list, split[0])
+                    }
                 }
             }
-            Ok(())
-        });
-        info!("Subscribed to {}", &config.nats.wl_subscribe_subject);
-    }
+            info!("Subscribed to {}", &subject);
+        }
+    });
 
-    // Subscribe for new IPs for blocklist
-    match nats.subscribe(&config.nats.bl_subscribe_subject) {
-        Ok(sub) => {
-            let list_name = config.ipset_black_list.clone();
-            let fw_type = config.fw_type.clone();
-            let cache = Arc::clone(&cache);
-            let ignore_ips = config.ignore_ips.clone();
-            sub.with_handler(move |message| {
-                if let Ok(string) = String::from_utf8(message.data) {
+    let list_name = config.ipset_black_list.clone();
+    let fw_type = config.fw_type.clone();
+    let cache = Arc::clone(&cache);
+    let ignore_ips = config.ignore_ips.clone();
+    let subject = config.nats.bl_subscribe_subject.clone();
+    let nats2 = nats.clone();
+    tokio::spawn(async move {
+        if let Ok(mut sub) = nats2.subscribe(subject.clone()).await {
+            while let Some(message) = sub.next().await {
+                if let Ok(string) = String::from_utf8(message.payload.to_vec()) {
                     //trace!("Got ip from my subject: {}", &string);
                     let (ip, tag) = get_ip_and_tag(&string);
                     if !valid_ip(&ip) {
                         warn!("Could not parse IP {} from {}", &ip, &string);
-                        return Ok(());
+                        continue;
                     }
                     if ignore_ips.contains(&ip) {
                         debug!("Ignoring IP {ip}");
-                        return Ok(());
+                        continue;
                     }
-                    if let Ok(cache) = cache.lock() {
+                    {
+                        let cache = cache.lock().await;
                         if cache.contains(&ip) {
-                            return Ok(());
+                            continue;
                         }
                     }
                     if tag.len() > 25 {
                         warn!("Too long tag '{}' from {}", &tag, &string);
-                        return Ok(());
+                        continue;
                     }
                     let list = match is_ipv6(&ip) {
                         true => format!("{}6", list_name),
@@ -513,101 +573,109 @@ fn start_nats_handlers(config: &mut Config, nats: &Connection, cache: Arc<Mutex<
                         FwType::NfTables => firewall::nft_add(&list, &ip)
                     }
                     let _ = kill_connection(&ip);
-                    if let Ok(mut cache) = cache.lock() {
+                    {
+                        let mut cache = cache.lock().await;
                         cache.push(ip, true);
                     }
                 }
-                Ok(())
-            });
-            info!("Subscribed to {}", &config.nats.bl_subscribe_subject);
+            }
+            info!("Subscribed to {}", &subject);
         }
-        Err(e) => error!("Error subscribing to BL updates from NATS server: {}", e)
-    }
+    });
 
-    // Subscribe for new IPs for blocklist
-    if let Ok(sub) = nats.subscribe(&config.nats.bl_global_subject) {
-        let list_name = config.ipset_black_list.clone();
-        let fw_type = config.fw_type.clone();
-        let max_block_time = config.max_block_time;
-        sub.with_handler(move |message| {
-            if let Ok(string) = String::from_utf8(message.data) {
-                trace!("Got ip from global subject: {}", &string);
-                let (ip, tag) = get_ip_and_tag(&string);
-                if !valid_ip(&ip) {
-                    warn!("Could not parse IP {} from {}", &ip, &string);
-                    return Ok(());
-                }
-                if tag.len() > 25 {
-                    warn!("Too long tag '{}' from {}", &tag, &string);
-                    return Ok(());
-                }
-                let (data, timeout) = match tag.parse::<u64>() {
-                    Ok(timeout) => {
-                        let timeout = if max_block_time > 0 {
-                            min(timeout, max_block_time)
-                        } else {
-                            timeout
+    let list_name = config.ipset_black_list.clone();
+    let fw_type = config.fw_type.clone();
+    let max_block_time = config.max_block_time;
+    let subject = config.nats.bl_global_subject.clone();
+    let nats2 = nats.clone();
+    tokio::spawn(async move {
+        async move {
+            // Subscribe for new IPs for blocklist
+            if let Ok(mut sub) = nats2.subscribe(subject.clone()).await {
+                while let Some(message) = sub.next().await {
+                    if let Ok(string) = String::from_utf8(message.payload.to_vec()) {
+                        trace!("Got ip from global subject: {}", &string);
+                        let (ip, tag) = get_ip_and_tag(&string);
+                        if !valid_ip(&ip) {
+                            warn!("Could not parse IP {} from {}", &ip, &string);
+                            continue;
+                        }
+                        if tag.len() > 25 {
+                            warn!("Too long tag '{}' from {}", &tag, &string);
+                            continue;
+                        }
+                        let (data, timeout) = match tag.parse::<u64>() {
+                            Ok(timeout) => {
+                                let timeout = if max_block_time > 0 {
+                                    min(timeout, max_block_time)
+                                } else {
+                                    timeout
+                                };
+                                (format!("{} timeout {}", &ip, timeout), timeout)
+                            },
+                            Err(_) => {
+                                let timeout = if max_block_time > 0 {
+                                    min(DEFAULT_BLOCK_TIME_SEC, max_block_time)
+                                } else {
+                                    DEFAULT_BLOCK_TIME_SEC
+                                };
+                                (ip.clone(), timeout)
+                            }
                         };
-                        (format!("{} timeout {}", &ip, timeout), timeout)
-                    },
-                    Err(_) => {
-                        let timeout = if max_block_time > 0 {
-                            min(DEFAULT_BLOCK_TIME_SEC, max_block_time)
-                        } else {
-                            DEFAULT_BLOCK_TIME_SEC
+                        let list = match is_ipv6(&ip) {
+                            true => format!("{}6", list_name),
+                            false => list_name.to_owned()
                         };
-                        (ip.clone(), timeout)
-                    }
-                };
-                let list = match is_ipv6(&ip) {
-                    true => format!("{}6", list_name),
-                    false => list_name.to_owned()
-                };
-                match fw_type {
-                    FwType::IpTables => firewall::ipset_add_or_del("add", &list, &data, None),
-                    FwType::NfTables => firewall::nft_add(&list, &data)
-                }
-                if let Ok(mut state) = state.lock() {
-                    if let Ok(ip) = ip.parse() {
-                        let blocked = Blocked::new(ip, None, timeout);
-                        state.add_blocked(blocked);
+                        match fw_type {
+                            FwType::IpTables => firewall::ipset_add_or_del("add", &list, &data, None),
+                            FwType::NfTables => firewall::nft_add(&list, &data)
+                        }
+                        if let Ok(ip) = ip.parse() {
+                            let mut state = state.lock().await;
+                            let blocked = Blocked::new(ip, None, timeout);
+                            state.add_blocked(blocked);
+                        }
+                        let _ = kill_connection(&ip);
                     }
                 }
-                let _ = kill_connection(&ip);
+                info!("Subscribed to {}", &subject);
             }
-            Ok(())
-        });
-        info!("Subscribed to {}", &config.nats.bl_global_subject);
-    }
+        }
+    });
 
-    // Subscribe for IPs to delete from whitelist
-    if let Ok(sub) = nats.subscribe(&config.nats.wl_del_subject) {
-        let list_name = config.ipset_white_list.clone();
-        sub.with_handler(move |message| {
-            if let Ok(string) = String::from_utf8(message.data) {
-                debug!("Got IP to delete from whitelist: {}", &string);
-                firewall::ipset_add_or_del("del", &list_name, &string, None);
+    let list_name = config.ipset_white_list.clone();
+    let subject = config.nats.wl_del_subject.clone();
+    let nats2 = nats.clone();
+    tokio::spawn(async move {
+        // Subscribe for IPs to delete from whitelist
+        if let Ok(mut sub) = nats2.subscribe(subject.clone()).await {
+            while let Some(message) = sub.next().await {
+                if let Ok(string) = String::from_utf8(message.payload.to_vec()) {
+                    debug!("Got IP to delete from whitelist: {}", &string);
+                    firewall::ipset_add_or_del("del", &list_name, &string, None);
+                }
             }
-            Ok(())
-        });
-        info!("Subscribed to {}", &config.nats.wl_del_subject);
-    }
+            info!("Subscribed to {}", &subject);
+        }
+    });
 
-    // Subscribe for IPs to delete from blocklist
-    if let Ok(sub) = nats.subscribe(&config.nats.bl_del_subject) {
-        let list_name = config.ipset_black_list.clone();
-        sub.with_handler(move |message| {
-            if let Ok(string) = String::from_utf8(message.data) {
-                debug!("Got IP to delete from blocklist: {}", &string);
-                firewall::ipset_add_or_del("del", &list_name, &string, None);
+    let list_name = config.ipset_black_list.clone();
+    let subject = config.nats.bl_del_subject.clone();
+    tokio::spawn(async move {
+            // Subscribe for IPs to delete from whitelist
+            if let Ok(mut sub) = nats.subscribe(subject.clone()).await {
+                while let Some(message) = sub.next().await {
+                    if let Ok(string) = String::from_utf8(message.payload.to_vec()) {
+                        debug!("Got IP to delete from blocklist: {}", &string);
+                        firewall::ipset_add_or_del("del", &list_name, &string, None);
+                    }
+                }
+                info!("Subscribed to {}", &subject);
             }
-            Ok(())
-        });
-        info!("Subscribed to {}", &config.nats.bl_del_subject);
-    }
+    });
 }
 
-fn lock_on_log_read(config: Config, nats: Option<Connection>, banned_count: &Arc<AtomicU32>, cache: Arc<Mutex<LruCache<String, bool>>>, state: Arc<Mutex<State>>) -> Result<(), io::Error> {
+async fn lock_on_log_read(config: Config, nats: Option<Client>, banned_count: Arc<AtomicU32>, cache: Arc<Mutex<LruCache<String, bool>>>) -> Result<(), io::Error> {
     match Command::new("journalctl")
         .arg("-f")
         .arg("--since=now")
@@ -625,17 +693,20 @@ fn lock_on_log_read(config: Config, nats: Option<Connection>, banned_count: &Arc
                     debug!("Journal opened, waiting for IPs");
                     let block_list = config.ipset_black_list.as_str();
                     let mut line = String::new();
-                    let delay = Duration::from_millis(2);
+                    let delay = Duration::from_millis(200);
                     let mut banned = HashMap::<String, (Instant, i32)>::new();
                     // Usual scanned ports of known services like databases, etc.
                     let service_ports = [1025, 1433, 1434, 1521, 1583, 1830, 2049, 3050, 3306, 3351, 3389, 5432, 5900, 6379, 7210, 8080, 8081, 8443, 9200, 9216, 9300, 11211];
                     const EPHEMERAL_PORT_START: u16 = 49152;
                     let open_ports = Ports::new(60);
                     loop {
-                        let len = reader.read_line(&mut line)?;
+                        let len = reader.read_line(&mut line).await.unwrap_or_else(|e| {
+                            warn!("Error reading journal: {e}");
+                            0
+                        });
                         if len > 0 {
                             if line.starts_with("diswall-log") {
-                                trace!("Got line from firewall: {}", line.replace("diswall-log ", ""));
+                                trace!("Got line from firewall: {}", line.replace("diswall-log", ""));
                                 if line.contains("SRC=0.0.0.0") {
                                     line.clear();
                                     continue;
@@ -666,13 +737,8 @@ fn lock_on_log_read(config: Config, nats: Option<Connection>, banned_count: &Arc
                                 // If the packet is going to sensitive port, we ban it no matter what
                                 if port < 1025 || service_ports.contains(&port) {
                                     debug!("{ip} Fast-banning, as scanning port {port}");
-                                    process_ip(&config, &nats, banned_count, &cache, &block_list, &ip);
-                                    if let Ok(mut state) = state.lock() {
-                                        if let Ok(ip) = ip.parse() {
-                                            let blocked = Blocked::new(ip, Some(port), DEFAULT_BLOCK_TIME_SEC);
-                                            state.add_blocked(blocked);
-                                        }
-                                    }
+                                    process_ip(&config, &nats, &banned_count, &cache, &block_list, &ip).await;
+                                    add_blocked_ip_to_state(&ip, Some(port)).await;
                                     banned.remove(&ip);
                                 } else {
                                     // Sometimes the kernel looses info about legit connections, and some packets are coming as not related to any connections.
@@ -694,13 +760,8 @@ fn lock_on_log_read(config: Config, nats: Option<Connection>, banned_count: &Arc
                                                 debug!("{ip} Incremented count to {count}, port {port}");
                                                 if *count >= max_count {
                                                     debug!("{ip} Banned for {count} port scans, port {port}");
-                                                    process_ip(&config, &nats, banned_count, &cache, &block_list, &ip);
-                                                    if let Ok(mut state) = state.lock() {
-                                                        if let Ok(ip) = ip.parse() {
-                                                            let blocked = Blocked::new(ip, Some(port), DEFAULT_BLOCK_TIME_SEC);
-                                                            state.add_blocked(blocked);
-                                                        }
-                                                    }
+                                                    process_ip(&config, &nats, &banned_count, &cache, &block_list, &ip).await;
+                                                    add_blocked_ip_to_state(&ip, Some(port)).await;
                                                     banned.remove(&ip);
                                                 }
                                             }
@@ -711,13 +772,8 @@ fn lock_on_log_read(config: Config, nats: Option<Connection>, banned_count: &Arc
                                                 banned.insert(ip.to_owned(), (Instant::now(), 1));
                                             } else {
                                                 debug!("{ip} Banned for first port scan, port {port}");
-                                                process_ip(&config, &nats, banned_count, &cache, &block_list, &ip);
-                                                if let Ok(mut state) = state.lock() {
-                                                    if let Ok(ip) = ip.parse() {
-                                                        let blocked = Blocked::new(ip, Some(port), DEFAULT_BLOCK_TIME_SEC);
-                                                        state.add_blocked(blocked);
-                                                    }
-                                                }
+                                                process_ip(&config, &nats, &banned_count, &cache, &block_list, &ip).await;
+                                                add_blocked_ip_to_state(&ip, Some(port)).await;
                                             }
                                         }
                                     }
@@ -734,50 +790,44 @@ fn lock_on_log_read(config: Config, nats: Option<Connection>, banned_count: &Arc
                                     let ip = line[pos..pos2].trim().to_string();
                                     let ban = format!("{}|ssh", &ip);
                                     trace!("Banning {ip}");
-                                    process_ip(&config, &nats, banned_count, &cache, &block_list, &ban);
-                                    if let Ok(mut state) = state.lock() {
-                                        if let Ok(ip) = ip.parse() {
-                                            let blocked = Blocked::new(ip, None, DEFAULT_BLOCK_TIME_SEC);
-                                            state.add_blocked(blocked);
-                                        }
-                                    }
+                                    process_ip(&config, &nats, &banned_count, &cache, &block_list, &ban).await;
+                                    add_blocked_ip_to_state(&ip, None).await;
                                 }
                             } else if line.contains("diswall-add") {
-                                let line = line.replace("diswall-add ", "");
+                                let line = line.replace("diswall-add", "");
                                 trace!("Got line from addon {}", &line);
-                                process_ip(&config, &nats, banned_count, &cache, &block_list, &line);
-                                if let Ok(mut state) = state.lock() {
-                                    if let Ok(ip) = line.parse() {
-                                        let blocked = Blocked::new(ip, None, DEFAULT_BLOCK_TIME_SEC);
-                                        state.add_blocked(blocked);
-                                    }
-                                }
+                                process_ip(&config, &nats, &banned_count, &cache, &block_list, &line).await;
+                                add_blocked_ip_to_state(&line, None).await;
                             } else if line.contains("authentication failed") && line.contains("SASL") {
                                 trace!("Got line from SASL");
                                 if let Some(ip) = extract_between_brackets(&line) {
                                     let ban = format!("{ip}|smtp");
-                                    process_ip(&config, &nats, banned_count, &cache, &block_list, &ban);
-                                    if let Ok(mut state) = state.lock() {
-                                        if let Ok(ip) = ip.parse() {
-                                            let blocked = Blocked::new(ip, None, DEFAULT_BLOCK_TIME_SEC);
-                                            state.add_blocked(blocked);
-                                        }
-                                    }
+                                    process_ip(&config, &nats, &banned_count, &cache, &block_list, &ban).await;
+                                    add_blocked_ip_to_state(&ip, None).await;
                                 }
                             }
                         } else {
-                            thread::sleep(delay);
+                            sleep(delay).await;
                         }
                         line.clear();
                     }
                 }
             }
         }
-        Err(e) => return Err(e)
+        Err(e) => Err(e)
     }
 }
 
-fn process_ip(config: &Config, nats: &Option<Connection>, banned_count: &Arc<AtomicU32>, cache: &Arc<Mutex<LruCache<String, bool>>>, block_list: &str, line: &str) {
+/// Adds blocked ip with port if there is one to UI state
+async fn add_blocked_ip_to_state(ip: &str, port: Option<u16>) {
+    if let Ok(ip) = ip.parse() {
+        let mut state = STATE.lock().await;
+        let blocked = Blocked::new(ip, port, DEFAULT_BLOCK_TIME_SEC);
+        state.add_blocked(blocked);
+    }
+}
+
+async fn process_ip(config: &Config, nats: &Option<Client>, banned_count: &Arc<AtomicU32>, cache: &Arc<Mutex<LruCache<String, bool>>>, block_list: &str, line: &str) {
     let (ip, tag) = get_ip_and_tag(line.trim());
     if !valid_ip(&ip) {
         warn!("Could not parse IP {} from {}", &ip, &line);
@@ -788,7 +838,8 @@ fn process_ip(config: &Config, nats: &Option<Connection>, banned_count: &Arc<Ato
         return;
     }
 
-    if let Ok(cache) = cache.lock() {
+    {
+        let cache = cache.lock().await;
         if cache.contains(&ip) {
             debug!("Already banned {}", &ip);
             return;
@@ -800,17 +851,18 @@ fn process_ip(config: &Config, nats: &Option<Connection>, banned_count: &Arc<Ato
         debug!("Got new IP: {}", &ip);
     }
 
-    if modify_list(&config.fw_type, true, &nats, &block_list, &config.nats.bl_push_subject, line.trim(), None) {
+    if modify_list(&config.fw_type, true, &nats, &block_list, &config.nats.bl_push_subject, line.trim(), None).await {
         let _ = kill_connection(&ip);
         let _ = banned_count.fetch_add(1u32, Ordering::SeqCst);
         // We push this IP to cache before we push it to NATS to avoid duplication
-        if let Ok(mut cache) = cache.lock() {
+        {
+            let mut cache = cache.lock().await;
             cache.push(ip.clone(), true);
         }
     }
 }
 
-fn modify_list(fw_type: &FwType, add: bool, nats: &Option<Connection>, list: &str, subject: &str, line: &str, comment: Option<String>) -> bool {
+async fn modify_list(fw_type: &FwType, add: bool, nats: &Option<Client>, list: &str, subject: &str, line: &str, comment: Option<String>) -> bool {
     let action = match add {
         true => "add",
         false => "del"
@@ -837,58 +889,37 @@ fn modify_list(fw_type: &FwType, add: bool, nats: &Option<Connection>, list: &st
 
     let mut result = false;
     if let Ok(addr) = ip.parse::<IpAddr>() {
-        match addr {
-            IpAddr::V4(ip) => {
-                if !ip.is_private() && !ip.is_loopback() && !ip.is_unspecified() {
-                    debug!("{} {} to/from {}", action, line, list);
-                    let ip = ip.to_string();
-                    match fw_type {
-                        FwType::IpTables => firewall::ipset_add_or_del(action, &list, &ip, comment),
-                        FwType::NfTables => {
-                            match add {
-                                true => firewall::nft_add(&list, &ip),
-                                false => firewall::nft_del(&list, &ip)
-                            }
-                        }
+        let adding = match addr {
+            IpAddr::V4(ip) => !ip.is_private() && !ip.is_loopback() && !ip.is_unspecified(),
+            IpAddr::V6(ip) => !ip.is_loopback() && !ip.is_unspecified()
+        };
+        if adding {
+            let ip = ip.to_string();
+            debug!("{} {} to/from {}", action, line, list);
+            match fw_type {
+                FwType::IpTables => firewall::ipset_add_or_del(action, &list, &ip, comment),
+                FwType::NfTables => {
+                    match add {
+                        true => firewall::nft_add(&list, &ip),
+                        false => firewall::nft_del(&list, &ip)
                     }
-                    if !tag.is_empty() {
-                        push_to_nats(&nats, subject, format!("{}|{}", &ip, tag));
-                    } else {
-                        push_to_nats(&nats, subject, ip);
-                    }
-                    result = true;
                 }
             }
-            IpAddr::V6(ip) => {
-                if !ip.is_loopback() && !ip.is_unspecified() {
-                    debug!("{} {} to/from {}", action, line, list);
-                    let ip = ip.to_string();
-                    match fw_type {
-                        FwType::IpTables => firewall::ipset_add_or_del(action, &list, &ip, comment),
-                        FwType::NfTables => {
-                            match add {
-                                true => firewall::nft_add(&list, &ip),
-                                false => firewall::nft_del(&list, &ip)
-                            }
-                        }
-                    }
-                    if !tag.is_empty() {
-                        push_to_nats(&nats, subject, format!("{}|{}", &ip, tag));
-                    } else {
-                        push_to_nats(&nats, subject, ip);
-                    }
-                    result = true;
-                }
+            if !tag.is_empty() {
+                push_to_nats(&nats, subject, format!("{}|{}", &ip, tag)).await;
+            } else {
+                push_to_nats(&nats, subject, ip).await;
             }
+            result = true;
         }
     }
     result
 }
 
 /// Publishes some IP to NATS server with particular subject
-fn push_to_nats(nats: &Option<Connection>, subject: &str, data: String) {
+async fn push_to_nats(nats: &Option<Client>, subject: &str, data: String) {
     if let Some(nats) = &nats {
-        match nats.publish(subject, &data) {
+        match nats.publish(subject.to_string(), data.clone().into()).await {
             Ok(_) => info!("Pushed {} to [{}]", &data, subject),
             Err(e) => warn!("Error pushing {} to [{}]: {}", &data, subject, e)
         }
@@ -938,7 +969,7 @@ fn get_options(args: &Vec<String>) -> (Options, Matches) {
 }
 
 /// Sets up logger in accordance with command line options
-fn setup_logger(opt_matches: &Matches) {
+fn setup_logger(opt_matches: &Matches) -> Result<(), std::io::Error> {
     let mut level = LevelFilter::Info;
     if opt_matches.opt_present("d") || env::var("DISWALL_DEBUG").is_ok() {
         level = LevelFilter::Trace;
@@ -952,6 +983,7 @@ fn setup_logger(opt_matches: &Matches) {
     let config = ConfigBuilder::new()
         .add_filter_ignore_str("rustls::")
         .add_filter_ignore_str("ureq::")
+        .add_filter_ignore_str("mio::poll")
         .set_thread_level(LevelFilter::Error)
         .set_location_level(LevelFilter::Off)
         .set_target_level(LevelFilter::Error)
@@ -968,14 +1000,14 @@ fn setup_logger(opt_matches: &Matches) {
             }
         }
         Some(path) => {
-            let file = match OpenOptions::new().write(true).create(true).open(&path) {
+            let file = match std::fs::OpenOptions::new().write(true).create(true).open(&path) {
                 Ok(mut file) => {
-                    file.seek(SeekFrom::End(0)).unwrap();
+                    file.seek(SeekFrom::End(0))?;
                     file
                 }
                 Err(e) => {
                     println!("Could not open log file '{}' for writing!\n{}", &path, e);
-                    exit(1);
+                    return Err(e);
                 }
             };
             let logger = CombinedLogger::init(vec![
@@ -987,9 +1019,10 @@ fn setup_logger(opt_matches: &Matches) {
             }
         }
     }
+    Ok(())
 }
 
-pub fn kill_connection(ip: &str) -> bool {
+pub async fn kill_connection(ip: &str) -> bool {
     let ip = if ip.contains(" ") {
         let parts = ip.split(" ").collect::<Vec<_>>();
         parts[0]
@@ -1015,7 +1048,7 @@ pub fn kill_connection(ip: &str) -> bool {
         .spawn();
     match command {
         Ok(mut child) => {
-            match child.wait() {
+            match child.wait().await {
                 Ok(status) => return status.success(),
                 Err(e) => error!("Error running ss: {}", e)
             }
@@ -1026,7 +1059,7 @@ pub fn kill_connection(ip: &str) -> bool {
 }
 
 /// Collects statistics about dropped packets and dropped bytes from iptables
-fn collect_stats_from_iptables(list_name: &str, subject: &str, nats: &Connection, banned_count: &Arc<AtomicU32>, prev_stats: &RwLock<Stats>) {
+async fn collect_stats_from_iptables(list_name: &str, subject: &str, nats: &Client, banned_count: &Arc<AtomicU32>, prev_stats: &RwLock<Stats>) {
     let time = OffsetDateTime::now_utc().unix_timestamp();
     let command = Command::new("iptables")
         .arg("-nxvL")
@@ -1035,7 +1068,7 @@ fn collect_stats_from_iptables(list_name: &str, subject: &str, nats: &Connection
         .spawn();
     match command {
         Ok(mut child) => {
-            match child.wait() {
+            match child.wait().await {
                 Ok(status) => {
                     if !status.success() {
                         warn!("Could not get stats from iptables");
@@ -1043,7 +1076,7 @@ fn collect_stats_from_iptables(list_name: &str, subject: &str, nats: &Connection
                     }
                     if let Some(mut out) = child.stdout.take() {
                         let mut buf = String::new();
-                        if let Ok(_) = out.read_to_string(&mut buf) {
+                        if let Ok(_) = out.read_to_string(&mut buf).await {
                             let lines = buf.split("\n").collect::<Vec<&str>>();
                             let banned = banned_count.load(Ordering::SeqCst);
                             // We clear banned count every hour
@@ -1079,7 +1112,7 @@ fn collect_stats_from_iptables(list_name: &str, subject: &str, nats: &Connection
                             // To distribute somehow requests to NATS server we make a random delay
                             let delay = Duration::from_secs(rand::random::<u64>() % 60);
                             thread::sleep(delay);
-                            if let Err(e) = nats.publish(subject, &data) {
+                            if let Err(e) = nats.publish(subject.to_string(), data.into()).await {
                                 warn!("Could not send stats to NATS server: {}", e);
                             }
                             prev_stats.write().unwrap().copy_from(&stats);
@@ -1094,7 +1127,7 @@ fn collect_stats_from_iptables(list_name: &str, subject: &str, nats: &Connection
 }
 
 /// Collects statistics about dropped packets and dropped bytes from iptables
-fn collect_stats_from_nftables(black_list_name: &str, white_list_name: &str, subject: &str, nats: &Connection, banned_count: &Arc<AtomicU32>, prev_stats: &RwLock<Stats>) {
+async fn collect_stats_from_nftables(black_list_name: &str, white_list_name: &str, subject: &str, nats: &Client, banned_count: &Arc<AtomicU32>, prev_stats: &RwLock<Stats>) {
     let time = OffsetDateTime::now_utc().unix_timestamp();
     let command = Command::new("nft")
         .arg("-j")
@@ -1104,15 +1137,15 @@ fn collect_stats_from_nftables(black_list_name: &str, white_list_name: &str, sub
         .spawn();
     match command {
         Ok(mut child) => {
-            match child.wait() {
+            match child.wait().await {
                 Ok(status) => {
                     if !status.success() {
-                        warn!("Could not get stats from iptables");
+                        warn!("Could not get stats from nftables");
                         return;
                     }
                     if let Some(mut out) = child.stdout.take() {
                         let mut buf = String::new();
-                        if let Ok(_) = out.read_to_string(&mut buf) {
+                        if let Ok(_) = out.read_to_string(&mut buf).await {
                             let banned = banned_count.load(Ordering::SeqCst);
                             // We clear banned count every hour
                             banned_count.store(0u32, Ordering::SeqCst);
@@ -1150,8 +1183,8 @@ fn collect_stats_from_nftables(black_list_name: &str, white_list_name: &str, sub
                             let data = serde_json::to_string(&stats_to_push).unwrap_or(String::from("Error serializing stats"));
                             // To distribute somehow requests to NATS server we make a random delay
                             let delay = Duration::from_secs(rand::random::<u64>() % 60);
-                            thread::sleep(delay);
-                            if let Err(e) = nats.publish(subject, &data) {
+                            tokio::time::sleep(delay).await;
+                            if let Err(e) = nats.publish(subject.to_string(), data.into()).await {
                                 warn!("Could not send stats to NATS server: {}", e);
                             }
                             prev_stats.write().unwrap().copy_from(&stats);
