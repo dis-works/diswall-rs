@@ -1,6 +1,6 @@
 [package]
 name = "diswall"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 homepage = "https://diswall.stream"
 repository = "https://github.com/dis-works/diswall-rs"
@@ -32,7 +32,7 @@ netsock = "0.3.0"
 libc = "=0.2.159"
 tokio = { version = "1.0.0", features = ["rt", "rt-multi-thread", "macros", "process", "fs", "io-std", "full"] }
 futures = "0.3.31"
-reqwest = { version = "0.12.12", features = ["native-tls-vendored"] }
+reqwest = { version = "0.12.12", features = ["rustls-tls"] }
 
 [profile.release]
 opt-level = 3
