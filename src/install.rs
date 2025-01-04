@@ -24,7 +24,7 @@ const CONFIG_PATH: &str = "/etc/diswall/diswall.conf";
 const IPT_INIT_PATH: &str = "/usr/bin/diswall_init.sh";
 const NFT_CONF_PATH: &str = "/etc/nftables.conf";
 
-const MAX_BIN_SIZE: usize = 10_000_000;
+const MAX_BIN_SIZE: usize = 20_000_000;
 
 #[cfg(not(windows))]
 pub(crate) fn install_client() -> io::Result<()> {
