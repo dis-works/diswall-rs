@@ -48,8 +48,16 @@ pub async fn run_server(config: Config, nats: Option<Client>) {
                     Ok(db) => get_list(&db, &client, &hostname, false),
                     Err(_) => String::new()
                 };
-                if let Err(e) = nats2.publish_with_reply(message.subject.clone(), message.subject.clone(), buffer.into()).await {
-                    warn!("Error sending {} to {}: {}", &message.subject, &client, e);
+                match message.reply {
+                    None => {
+                        warn!("No reply subject supplied for request {}", &message.subject);
+                    }
+                    Some(reply) => {
+                        info!("Sending response to {}", &reply);
+                        if let Err(e) = nats2.publish(reply, buffer.into()).await {
+                            warn!("Error sending {} to {}: {}", &message.subject, &client, e);
+                        }
+                    }
                 }
             }
             info!("Subscribed to {}", &subject);
@@ -73,9 +81,18 @@ pub async fn run_server(config: Config, nats: Option<Client>) {
                     },
                     Err(_) => String::new()
                 };
-                if let Err(e) = nats2.publish_with_reply(message.subject.clone(), message.subject.clone(), buffer.into()).await {
-                    warn!("Error sending {} to {}: {}", &message.subject, &client, e);
+                match message.reply {
+                    None => {
+                        warn!("No reply subject supplied for request {}", &message.subject);
+                    }
+                    Some(reply) => {
+                        info!("Sending response to {}", &reply);
+                        if let Err(e) = nats2.publish(reply, buffer.into()).await {
+                            warn!("Error sending {} to {}: {}", &message.subject, &client, e);
+                        }
+                    }
                 }
+                
             }
             info!("Subscribed to {}", &subject);
         }
@@ -297,7 +314,7 @@ async fn start_stats_handler(stats_subject: String, nats: Client, tx: Sender<Str
                     match serde_json::from_str::<Stats>(&string) {
                         Ok(stats) => {
                             let request = format!("INSERT INTO stats VALUES ('{}/{}', {}, {}, {}, {}, {}, {})",
-                                                  &client, &hostname, stats.time, stats.banned,
+                                                  &client, &hostname, stats.time - (stats.time % 3600), stats.banned,
                                                   stats.packets_dropped, stats.bytes_dropped,
                                                   stats.packets_accepted, stats.bytes_accepted);
                             if let Err(e) = tx.send(request).await {

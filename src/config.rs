@@ -130,7 +130,10 @@ impl Default for Config {
 /// Nginx error logs configuration, a part of main config structure, is loaded from same TOML
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Nginx {
-    pub(crate) logs: Vec<String>
+    #[serde(default)]
+    pub(crate) logs: Vec<String>,
+    #[serde(default)]
+    pub(crate) access: Vec<String>
 }
 
 /// NATS client configuration, a part of main config structure, is loaded from same TOML
@@ -203,7 +206,7 @@ pub struct ClickHouseConfig {
     pub salt: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub enum FwType {
     #[default]
     IpTables,

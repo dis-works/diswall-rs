@@ -9,6 +9,7 @@ use ratatui::text::{Line, Span};
 use serde::{Deserialize, Serialize};
 
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct State {
     pub blocked: Vec<Blocked>,
     pub mean: Vec<Blocked>,

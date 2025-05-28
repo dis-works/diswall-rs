@@ -1,4 +1,4 @@
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 #[cfg(not(windows))]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11,11 +11,11 @@ use crate::ui::messages::StateMessage;
 
 pub struct UiServer {
     socket_path: String,
-    state: Arc<Mutex<State>>
+    state: Arc<RwLock<State>>
 }
 
 impl UiServer {
-    pub fn new(socket_path: String, state: Arc<Mutex<State>>) -> Self {
+    pub fn new(socket_path: String, state: Arc<RwLock<State>>) -> Self {
         Self { socket_path, state }
     }
 
@@ -47,7 +47,7 @@ impl Drop for UiServer {
     }
 }
 
-async fn handle_client(mut stream: tokio::net::UnixStream, state: Arc<Mutex<State>>) {
+async fn handle_client(mut stream: tokio::net::UnixStream, state: Arc<RwLock<State>>) {
     let mut buffer = [0; 512];
 
     info!("UI client connected");
@@ -78,7 +78,7 @@ async fn handle_client(mut stream: tokio::net::UnixStream, state: Arc<Mutex<Stat
                         StateMessage::Ping => {}
                         StateMessage::Changed => {}
                         StateMessage::GetBlocked(_num) => {
-                            let state = state.lock().await;
+                            let state = state.read().await;
                             let lines = state.get_blocked(last_item);
                             let response = StateMessage::Blocked(lines);
                             let buf = rmp_serde::encode::to_vec_named(&response).unwrap();
@@ -98,7 +98,7 @@ async fn handle_client(mut stream: tokio::net::UnixStream, state: Arc<Mutex<Stat
         }
 
         let blocked = {
-            let state = state.lock().await;
+            let state = state.read().await;
             let blocked = state.get_blocked(last_item);
             if !blocked.is_empty() {
                 Some(blocked)
@@ -127,7 +127,7 @@ async fn handle_client(mut stream: tokio::net::UnixStream, state: Arc<Mutex<Stat
             last_time = std::time::Instant::now();
         }
         {
-            let state = state.lock().await;
+            let state = state.read().await;
             if last_login_state != state.logged_in {
                 let message = StateMessage::LogStatus(state.logged_in.clone());
                 let buf = rmp_serde::encode::to_vec_named(&message).unwrap();
