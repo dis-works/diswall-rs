@@ -316,11 +316,12 @@ pub(crate) fn update_client() -> io::Result<()> {
             };
 
             info!("Downloading new binary from {}", &url);
-            match ureq::get(&url).call() {
+            match ureq::get(url).call() {
                 Err(e) => warn!("Error getting release build from {}: {}", &url, e),
                 Ok(response) => {
                     let mut bytes: Vec<u8> = Vec::with_capacity(MAX_BIN_SIZE);
-                    response.into_reader()
+                    response.into_body()
+                        .as_reader()
                         .take(MAX_BIN_SIZE as u64)
                         .read_to_end(&mut bytes)?;
 
@@ -600,7 +601,13 @@ fn get_listening_services() -> HashSet<Service> {
 fn get_last_release() -> Result<Update, String> {
     match ureq::get(RELEASE_URL).call() {
         Ok(response) => {
-            let string = response.into_string().unwrap();
+            let string = match response.into_body().read_to_string() {
+                Ok(text) => text,
+                Err(e) => {
+                    error!("Error reading last release from GitHub: {e}");
+                    return Err(e.to_string());
+                }
+            };
             match serde_json::from_str(&string) {
                 Ok(update) => Ok(update),
                 Err(e) => Err(e.to_string())
